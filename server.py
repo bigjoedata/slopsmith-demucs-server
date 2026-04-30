@@ -228,6 +228,17 @@ def _whisperx_compute_type() -> str:
     return "float16" if _whisperx_device() == "cuda" else "int8"
 
 
+def _mark_lazy_loaded(name: str) -> None:
+    """Update warmup_state to ``ready`` after a successful lazy load.
+    Called from the lazy-load helpers so /health reflects truth even
+    when the user passed --skip-warmup or warmup itself failed and
+    the endpoint subsequently lazy-loaded its model on first use."""
+    with warmup_state_lock:
+        current = warmup_state.get(name)
+    if current != "ready":
+        _set_warmup_state(name, "ready")
+
+
 def _get_whisperx_model():
     global _whisperx_model
     if _whisperx_model is None:
@@ -238,6 +249,7 @@ def _get_whisperx_model():
                     device=_whisperx_device(),
                     compute_type=_whisperx_compute_type(),
                 )
+    _mark_lazy_loaded("whisperx")
     return _whisperx_model
 
 
@@ -248,6 +260,7 @@ def _get_whisperx_aligner(language: str):
     with _whisperx_aligners_lock:
         cached = _whisperx_aligners.get(lang)
         if cached is not None:
+            _mark_lazy_loaded("whisperx")
             return cached
     # load_align_model can be slow on first call (downloads wav2vec2
     # weights). Release the lock during the actual load so a concurrent
@@ -261,8 +274,10 @@ def _get_whisperx_aligner(language: str):
     with _whisperx_aligners_lock:
         existing = _whisperx_aligners.get(lang)
         if existing is not None:
+            _mark_lazy_loaded("whisperx")
             return existing
         _whisperx_aligners[lang] = pair
+    _mark_lazy_loaded("whisperx")
     return pair
 
 
@@ -380,44 +395,99 @@ async def align_lyrics(
             if not flat_words:
                 return {"error": "lyrics text contains no words"}
 
-            # Resolve language — used only to pick the wav2vec2 aligner.
-            # Whisper transcription text is intentionally discarded; the
-            # contract is forced alignment of caller-supplied text. We
-            # sample the middle 60s of the audio rather than the first
-            # 30s so songs with long instrumental intros / late-starting
-            # vocals still detect reliably.
-            detected_lang = (language or "").lower().strip()
-            if not detected_lang:
-                try:
-                    asr_model = _get_whisperx_model()
-                    window_s = min(60.0, audio_duration)
-                    mid = audio_duration / 2.0
-                    start_s = max(0.0, mid - window_s / 2.0)
-                    end_s = min(audio_duration, mid + window_s / 2.0)
-                    s_idx = int(start_s * 16000)
-                    e_idx = int(end_s * 16000)
-                    sample = audio[s_idx:e_idx] if e_idx > s_idx else audio
-                    detected = asr_model.transcribe(sample, batch_size=16)
-                    detected_lang = (detected.get("language") or "en").lower()
-                except Exception:
-                    detected_lang = "en"
-
-            # Forced alignment with a single segment spanning the whole
-            # audio. wav2vec2 Viterbi-decodes the optimal char-to-frame
-            # mapping globally, which is robust to long instrumental
-            # intros, mid-song breaks, and uneven line pacing — none of
-            # those constrain where individual words can land. (Per-line
-            # windows would force each line into a hard time slice and
-            # break exactly those cases.)
+            # Run Whisper transcription. We use it for two purposes:
+            #   1. Language detection (free byproduct of the call).
+            #   2. VAD-anchored alignment windows — Whisper skips long
+            #      instrumental sections, so the segments it returns
+            #      correspond to actual sung audio. The transcribed
+            #      text is intentionally discarded (forced alignment
+            #      uses caller-supplied lyrics); we keep only the
+            #      time boundaries.
             #
-            # new_line markers are recovered after alignment by matching
-            # aligned word output to the parallel word_to_line array
-            # built above.
-            custom_segments = [{
-                "start": 0.0,
-                "end": float(audio_duration),
-                "text": " ".join(flat_words),
-            }]
+            # Why not single-segment global align? wav2vec2 forced
+            # alignment scales with input length; multi-minute songs
+            # work fine but very long inputs can OOM. Why not per-line
+            # proportional windows? Long intros / instrumental breaks
+            # can land a line's window over silence. VAD chunking
+            # threads both needles: each window is anchored to actual
+            # speech (no silence misalignment) and short (no OOM).
+            asr_model = _get_whisperx_model()
+            transcribe_kwargs: dict = {"batch_size": 16}
+            if language:
+                transcribe_kwargs["language"] = language.lower()
+            transcribed = asr_model.transcribe(audio, **transcribe_kwargs)
+            detected_lang = (transcribed.get("language") or language or "en").lower()
+            raw_speech_segments = transcribed.get("segments", []) or []
+
+            # Drop tiny / zero-duration segments — wav2vec2 align tends
+            # to produce empty alignments for sub-frame windows.
+            speech_segments = [
+                s for s in raw_speech_segments
+                if float(s.get("end", 0.0)) - float(s.get("start", 0.0)) > 0.2
+            ]
+
+            # Distribute user-text words across speech segments
+            # proportionally to each segment's duration. word_to_segment
+            # records which speech segment each input word landed in,
+            # which we use later (alongside word_to_line) to recover
+            # new_line markers after wav2vec2 align.
+            word_to_segment: list[int] = [0] * len(flat_words)
+            custom_segments: list[dict] = []
+
+            if not speech_segments:
+                # Fallback for very short audio or VAD-empty results:
+                # one segment covering the whole audio. wav2vec2 will
+                # align everything in one pass — fine for short clips.
+                custom_segments.append({
+                    "start": 0.0,
+                    "end": float(audio_duration),
+                    "text": " ".join(flat_words),
+                })
+            else:
+                total_dur = sum(
+                    float(s["end"]) - float(s["start"])
+                    for s in speech_segments
+                ) or audio_duration
+
+                # Cumulative end-word index per speech segment, weighted
+                # by duration. Pin the last entry to len(flat_words) so
+                # rounding error doesn't drop trailing words.
+                cumulative: list[int] = []
+                running = 0.0
+                for s in speech_segments:
+                    seg_dur = float(s["end"]) - float(s["start"])
+                    running += (seg_dur / total_dur) * len(flat_words)
+                    cumulative.append(int(round(running)))
+                cumulative[-1] = len(flat_words)
+
+                cursor = 0
+                for seg_idx, (s, end_word_idx) in enumerate(zip(speech_segments, cumulative)):
+                    end_word_idx = max(end_word_idx, cursor)
+                    if end_word_idx <= cursor:
+                        # No words allocated to this speech segment —
+                        # skip it. Common for very short utterances.
+                        continue
+                    chunk_words = flat_words[cursor:end_word_idx]
+                    for wi in range(cursor, end_word_idx):
+                        word_to_segment[wi] = len(custom_segments)
+                    custom_segments.append({
+                        "start": round(float(s["start"]), 3),
+                        "end": round(float(s["end"]), 3),
+                        "text": " ".join(chunk_words),
+                    })
+                    cursor = end_word_idx
+
+                # Trailing words (rounding can leave a few unassigned)
+                # → fold into the last segment.
+                if cursor < len(flat_words) and custom_segments:
+                    trailing = flat_words[cursor:]
+                    custom_segments[-1]["text"] += " " + " ".join(trailing)
+                    last_seg = len(custom_segments) - 1
+                    for wi in range(cursor, len(flat_words)):
+                        word_to_segment[wi] = last_seg
+
+            if not custom_segments:
+                return {"error": "no speech segments found to align against"}
 
             aligner_model, aligner_meta = _get_whisperx_aligner(detected_lang)
             aligned = whisperx.align(
@@ -648,6 +718,10 @@ def _extract_pitch_with_crepe(audio_path: Path, lyrics: list[dict]) -> list[dict
         device=device,
         return_periodicity=True,
     )
+    # First successful run implies the CREPE weights are loaded and
+    # the model is functional — flip /health.warmup.crepe to ready
+    # for the lazy-load (--skip-warmup or post-failure) path.
+    _mark_lazy_loaded("crepe")
     # torchcrepe applies a Viterbi-like decoder when batched; periodicity
     # serves the role pYIN's voiced_prob played in tier 1 — a 0..1
     # confidence per frame.
@@ -689,12 +763,20 @@ def _extract_pitch_with_crepe(audio_path: Path, lyrics: list[dict]) -> list[dict
                 semitones = np.rint(69 + 12 * np.log2(hz / 440.0)).astype(int)
 
                 # Range narrowing: drop frames outside ±12 semitones of
-                # the song median when we have a stable reference. Keep
-                # the unclamped version too in case clamping kills every
-                # frame (legitimately out-of-range high notes).
+                # the song median ONLY when the in-range frames carry
+                # enough of the syllable's confidence weight that they
+                # represent the syllable's actual pitch. A syllable
+                # hitting a legitimate high/low note will have most of
+                # its weight outside the clamp range — narrowing then
+                # would snap the bar onto a few noisy in-range frames
+                # instead of the real note. Require ≥50% of the
+                # syllable's voicing confidence to be in-range before
+                # discarding the rest.
                 if clamp_low is not None and clamp_high is not None:
                     in_range = (semitones >= clamp_low) & (semitones <= clamp_high)
-                    if in_range.any():
+                    total_w = float(w.sum())
+                    in_range_w = float(w[in_range].sum()) if in_range.any() else 0.0
+                    if total_w > 0 and in_range_w / total_w >= 0.5:
                         semitones = semitones[in_range]
                         w = w[in_range]
 
@@ -960,6 +1042,10 @@ def _run_demucs(job_id, audio_path, stem_list, model):
             _update_job(job_id, status="failed", error=err_msg[:1000])
             return
 
+        # First successful demucs run implies the model weights are
+        # loaded — flip /health.warmup.demucs to ready for the
+        # lazy-load (--skip-warmup or post-warmup-failure) path.
+        _mark_lazy_loaded("demucs")
         _update_job(job_id, progress=80)
 
         # Find output stems
