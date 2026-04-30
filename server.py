@@ -234,7 +234,12 @@ async def separate_url(
 _whisperx_model = None
 _whisperx_model_lock = threading.Lock()
 _whisperx_model_name = "medium"
-_whisperx_aligners: dict[str, tuple] = {}
+# OrderedDict for LRU eviction semantics — a multilingual server
+# accumulating dozens of ~1 GB wav2vec2 aligners would OOM. Bounded
+# by MAX_WHISPERX_ALIGNERS; the least-recently-used aligner is evicted
+# when the cap is exceeded.
+MAX_WHISPERX_ALIGNERS = int(os.environ.get("SLOPSMITH_MAX_WHISPERX_ALIGNERS", "4"))
+_whisperx_aligners: OrderedDict[str, tuple] = OrderedDict()
 _whisperx_aligners_lock = threading.Lock()
 # Per-language locks so a /align call for language A doesn't block a
 # concurrent /align for language B, while two concurrent calls for the
@@ -323,8 +328,16 @@ def _get_whisperx_aligner(language: str):
     # Fast path: already cached.
     with _whisperx_aligners_lock:
         cached = _whisperx_aligners.get(lang)
+        if cached is not None:
+            # LRU touch — move to end so eviction picks the
+            # least-recently-used language first.
+            _whisperx_aligners.move_to_end(lang)
     if cached is not None:
-        _mark_lazy_loaded("whisperx")
+        # Top-level "whisperx" warmup contract is "ASR + en aligner".
+        # Lazy-loading a non-English aligner shouldn't satisfy it; only
+        # an "en" load promotes the top-level state.
+        if lang == "en":
+            _mark_lazy_loaded("whisperx")
         return cached
 
     # Slow path: serialise on the per-language lock so only one thread
@@ -335,8 +348,11 @@ def _get_whisperx_aligner(language: str):
         # populated the cache while we were waiting.
         with _whisperx_aligners_lock:
             cached = _whisperx_aligners.get(lang)
+            if cached is not None:
+                _whisperx_aligners.move_to_end(lang)
         if cached is not None:
-            _mark_lazy_loaded("whisperx")
+            if lang == "en":
+                _mark_lazy_loaded("whisperx")
             return cached
         # Surface per-language download progress on /health so non-
         # English /align callers can poll for their language's
@@ -351,11 +367,30 @@ def _get_whisperx_aligner(language: str):
         except Exception as exc:  # noqa: BLE001
             _set_aligner_state(lang, f"failed: {exc}")
             raise
+        evicted_langs: list[str] = []
         with _whisperx_aligners_lock:
             _whisperx_aligners[lang] = pair
+            _whisperx_aligners.move_to_end(lang)
+            # LRU evict to bound RAM/VRAM. Each wav2vec2 aligner is
+            # ~1 GB; without a cap a multilingual server accumulates
+            # forever and eventually OOMs /align or /separate.
+            while len(_whisperx_aligners) > MAX_WHISPERX_ALIGNERS:
+                old_lang, _old_pair = _whisperx_aligners.popitem(last=False)
+                evicted_langs.append(old_lang)
         _set_aligner_state(lang, "ready")
+        for el in evicted_langs:
+            _set_aligner_state(el, "evicted")
+        # Best-effort GPU memory release after eviction. Safe to call
+        # on CPU (no-op).
+        if evicted_langs:
+            try:
+                if _whisperx_device() == "cuda":
+                    torch.cuda.empty_cache()
+            except Exception:
+                pass
 
-    _mark_lazy_loaded("whisperx")
+    if lang == "en":
+        _mark_lazy_loaded("whisperx")
     return pair
 
 
@@ -527,42 +562,38 @@ async def align_lyrics(
                 })
             else:
                 # Distribute user-text words across speech segments by
-                # the number of words Whisper transcribed in each
-                # segment, NOT by segment duration. Words-per-second
-                # varies wildly within a song (sustained ballad lines
-                # vs. fast chorus), so duration-weighting can land
-                # whole phrases in the wrong segment. Whisper's own
-                # transcribed word count per segment reflects the
-                # actual local tempo: a long held note shows up as
-                # one transcribed word in a long segment, a fast run
-                # shows up as many words in a short segment. Using
-                # that as the weight keeps the user→segment mapping
-                # tempo-aware.
+                # local tempo. Whisper's per-segment transcribed word
+                # count is the best proxy when available — a long held
+                # note shows up as one transcribed word, a fast run
+                # shows up as many. But Whisper sometimes returns
+                # segments that have timing without transcribed text
+                # (noisy stems, humming, unintelligible vocals); those
+                # segments still contain singing, so user lyrics need
+                # to land there too. Building a hybrid per-segment
+                # weight: transcribed word count when present, else
+                # duration × an assumed tempo of ~3 words/sec so the
+                # magnitudes are comparable to the word-count weights.
                 #
-                # Fallback to duration weighting if transcription text
-                # is sparse / empty (Whisper sometimes returns segments
-                # with timing but no text on noisy stems).
-                transcribed_word_counts = [
-                    len((s.get("text") or "").split())
-                    for s in speech_segments
-                ]
-                total_transcribed_words = sum(transcribed_word_counts)
+                # This avoids the round-8 finding's failure mode: an
+                # all-zero-words segment in the middle of a song
+                # causing all subsequent user text to shift into later
+                # segments.
+                ASSUMED_WPS = 3.0  # rough singing tempo for fallback
+                weights: list[float] = []
+                for s in speech_segments:
+                    n = len((s.get("text") or "").split())
+                    if n > 0:
+                        weights.append(float(n))
+                    else:
+                        seg_dur = float(s["end"]) - float(s["start"])
+                        weights.append(max(0.1, seg_dur * ASSUMED_WPS))
 
+                total_w = sum(weights) or 1.0
                 cumulative: list[int] = []
                 running = 0.0
-                if total_transcribed_words > 0:
-                    for n_words in transcribed_word_counts:
-                        running += (n_words / total_transcribed_words) * len(flat_words)
-                        cumulative.append(int(round(running)))
-                else:
-                    total_dur = sum(
-                        float(s["end"]) - float(s["start"])
-                        for s in speech_segments
-                    ) or audio_duration
-                    for s in speech_segments:
-                        seg_dur = float(s["end"]) - float(s["start"])
-                        running += (seg_dur / total_dur) * len(flat_words)
-                        cumulative.append(int(round(running)))
+                for w in weights:
+                    running += (w / total_w) * len(flat_words)
+                    cumulative.append(int(round(running)))
                 # Pin the last entry to len(flat_words) so rounding
                 # error doesn't drop trailing words.
                 cumulative[-1] = len(flat_words)
