@@ -631,7 +631,7 @@ async def align_lyrics(
                 cumulative[-1] = len(flat_words)
 
                 cursor = 0
-                for seg_idx, (s, end_word_idx) in enumerate(zip(speech_segments, cumulative)):
+                for _, (s, end_word_idx) in enumerate(zip(speech_segments, cumulative)):
                     end_word_idx = max(end_word_idx, cursor)
                     if end_word_idx <= cursor:
                         # No words allocated to this speech segment —
@@ -652,7 +652,7 @@ async def align_lyrics(
                     custom_segments[-1]["text"] += " " + " ".join(trailing)
 
             if not custom_segments:
-                return {"error": "no speech segments found to align against"}
+                return {"error": "no speech segments found to align against", "_http_status": 400}
 
             aligner_model, aligner_meta = _get_whisperx_aligner(detected_lang)
             aligned = whisperx.align(
@@ -892,6 +892,11 @@ async def align_lyrics(
                     })
 
             return {"segments": segments_out, "language": detected_lang}
+        except ValueError as e:
+            # ValueError signals client input problems (e.g. invalid
+            # language code) — expose as 400 so clients can distinguish
+            # their own mistakes from server faults.
+            return {"error": str(e), "_http_status": 400}
         except Exception as e:
             return {"error": str(e)}
         finally:
@@ -901,7 +906,7 @@ async def align_lyrics(
                 pass
 
     import asyncio
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     result = await loop.run_in_executor(None, _do_align)
 
     if "error" in result:
@@ -1137,7 +1142,7 @@ async def pitch_extract(
                 pass
 
     import asyncio
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     result = await loop.run_in_executor(None, _do_extract)
     if "error" in result:
         return JSONResponse(result, 500)
@@ -1402,11 +1407,12 @@ def _detect_gpu():
 # operator has no idea what's happening.
 #
 # Warmup runs all three downloads sequentially in a daemon thread that
-# is spawned right before uvicorn binds the port. Each library's own
-# tqdm progress bar is left untouched so the operator sees real
-# byte-level progress in the terminal / journal. /health additionally
-# reports a per-model state dict so client UIs (the lyrics_karaoke
-# plugin, etc.) can poll for "warming up" status and surface progress.
+# is spawned from the FastAPI startup event (after uvicorn has bound
+# the port). Each library's own tqdm progress bar is left untouched so
+# the operator sees real byte-level progress in the terminal / journal.
+# /health additionally reports a per-model state dict so client UIs
+# (the lyrics_karaoke plugin, etc.) can poll for "warming up" status
+# and surface progress.
 
 def _warmup_demucs() -> None:
     """Pre-download the configured demucs separation model. Invokes

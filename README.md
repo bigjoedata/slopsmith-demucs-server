@@ -108,7 +108,7 @@ Values:
 - `pending` → `downloading` → `ready` — normal warmup progression.
 - `failed: <reason>` — download or model-load error; endpoint still works, just lazy-downloads on first request.
 - `skipped` — `--skip-warmup` was passed; per-endpoint calls lazy-download on demand.
-- `evicted` — an LRU aligner was evicted to free memory (only appears in `whisperx_aligners`).
+- `evicted` — an LRU aligner was evicted to free memory (appears in `whisperx_aligners`; also appears at the top-level `whisperx` field if the English aligner is evicted, since that breaks the warmup contract).
 
 Subsequent restarts use the cached weights and reach `ready` within
 a couple of seconds. Pass `--skip-warmup` if you need to start the
