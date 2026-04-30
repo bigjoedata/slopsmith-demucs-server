@@ -728,24 +728,49 @@ async def align_lyrics(
                     }
 
                 # Fill missing lines by interpolating between known
-                # neighbours: previous line's end → next line's start.
-                # Edges fall back to 0 / audio_duration.
-                for line_idx in range(len(lines)):
-                    if line_times[line_idx] is not None:
+                # neighbours. Runs of consecutive missing lines split
+                # the gap evenly so timestamps stay monotonic — a naive
+                # per-line walk would assign each missing line the
+                # FULL prev_end..next_start gap, producing overlapping
+                # or out-of-order entries when two or more adjacent
+                # lines failed to align.
+                i = 0
+                while i < len(lines):
+                    if line_times[i] is not None:
+                        i += 1
                         continue
+                    # Find the run of consecutive missing lines [i, j).
+                    j = i
+                    while j < len(lines) and line_times[j] is None:
+                        j += 1
+                    # Anchor times: last real timing before i, first
+                    # real timing at-or-after j.
                     prev_end = 0.0
-                    for j in range(line_idx - 1, -1, -1):
-                        if line_times[j] is not None:
-                            prev_end = line_times[j][1]
+                    for k in range(i - 1, -1, -1):
+                        if line_times[k] is not None:
+                            prev_end = line_times[k][1]
                             break
                     next_start = audio_duration
-                    for j in range(line_idx + 1, len(lines)):
-                        if line_times[j] is not None:
-                            next_start = line_times[j][0]
+                    for k in range(j, len(lines)):
+                        if line_times[k] is not None:
+                            next_start = line_times[k][0]
                             break
+                    n_missing = j - i
+                    # Guarantee at least a small forward slot per line
+                    # so timestamps stay monotonic even if anchors are
+                    # collapsed (e.g. all lines missing → fall back to
+                    # 0 → audio_duration shared).
                     if next_start <= prev_end:
-                        next_start = min(audio_duration, prev_end + 0.5)
-                    line_times[line_idx] = (prev_end, next_start)
+                        next_start = min(audio_duration, prev_end + 0.5 * n_missing)
+                    slice_dur = (next_start - prev_end) / n_missing
+                    for k in range(i, j):
+                        slot_start = prev_end + slice_dur * (k - i)
+                        slot_end = prev_end + slice_dur * (k - i + 1)
+                        line_times[k] = (
+                            slot_start,
+                            min(slot_end, audio_duration),
+                        )
+                    i = j
 
                 for line_idx, ln in enumerate(lines):
                     seg_start, seg_end = line_times[line_idx]  # type: ignore[misc]
