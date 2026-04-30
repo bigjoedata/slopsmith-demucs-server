@@ -41,13 +41,12 @@ demucs.audio.save_audio = patched_save_audio
 def _download_only() -> int:
     """Load the requested model (downloading via torch.hub if needed),
     then exit. Args mirror the subset of demucs.separate flags we use:
-    -n MODEL, -d DEVICE.
+    -n MODEL.
     """
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("--download-only", action="store_true")
     parser.add_argument("-n", "--name", default="htdemucs_ft")
-    parser.add_argument("-d", "--device", default="cpu")
     args, _unknown = parser.parse_known_args()
 
     # demucs.pretrained.get_model() is the stable cross-version API on

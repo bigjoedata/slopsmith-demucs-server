@@ -80,10 +80,12 @@ three endpoints so the first user-facing request doesn't stall on a
 CDN fetch. Total download is **~1.5 GB** (htdemucs_ft, Whisper medium,
 CREPE full, wav2vec2-base for the active language).
 
-The download runs in a background thread after the server binds the
-port, so `/health` is queryable immediately. Each library prints its
-own `tqdm` progress bar to stderr — the operator sees real byte-level
-progress in the terminal or in `journalctl -u slopsmith-demucs --follow`.
+The download runs in a background thread started from the FastAPI
+startup hook, so it fires only after the server has bound the port —
+meaning `/health` is queryable from the very first moment.  Each
+library prints its own `tqdm` progress bar to stderr — the operator
+sees real byte-level progress in the terminal or in
+`journalctl -u slopsmith-demucs --follow`.
 
 `/health` reports per-model status under `warmup`:
 
@@ -102,7 +104,12 @@ progress in the terminal or in `journalctl -u slopsmith-demucs --follow`.
 }
 ```
 
-Values: `pending` → `downloading` → `ready`, or `failed: <reason>`.
+Values:
+- `pending` → `downloading` → `ready` — normal warmup progression.
+- `failed: <reason>` — download or model-load error; endpoint still works, just lazy-downloads on first request.
+- `skipped` — `--skip-warmup` was passed; per-endpoint calls lazy-download on demand.
+- `evicted` — an LRU aligner was evicted to free memory (only appears in `whisperx_aligners`).
+
 Subsequent restarts use the cached weights and reach `ready` within
 a couple of seconds. Pass `--skip-warmup` if you need to start the
 server in an environment without internet access; per-endpoint calls

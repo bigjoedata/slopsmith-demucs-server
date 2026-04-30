@@ -55,6 +55,8 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+# Default: run warmup. main() overrides to True when --skip-warmup is passed.
+app.state.skip_warmup = False
 
 # Jobs: job_id -> {status, progress, stems, error, created_at, audio_hash, model}
 jobs: OrderedDict[str, dict] = OrderedDict()
@@ -81,6 +83,7 @@ _gpu_available = False
 # the status of each model.
 
 # warmup_state[name] = "pending" | "downloading" | "ready" | "failed: <reason>"
+#                    | "skipped" (--skip-warmup) | "evicted" (LRU aligner evicted)
 warmup_state: dict[str, str] = {
     "demucs": "pending",
     "whisperx": "pending",
@@ -121,6 +124,22 @@ async def check_api_key(request, call_next):
         if key != API_KEY:
             return JSONResponse({"error": "Unauthorized"}, 401)
     return await call_next(request)
+
+
+# ── Startup hook ─────────────────────────────────────────────────────────
+#
+# The warmup is registered here so it runs AFTER uvicorn has bound the
+# port — meaning /health is already queryable the moment the warmup
+# thread starts. Starting the thread before uvicorn.run() would give no
+# such guarantee.
+
+@app.on_event("startup")
+async def _startup_event():
+    if app.state.skip_warmup:
+        for k in warmup_state:
+            _set_warmup_state(k, "skipped")
+    else:
+        threading.Thread(target=_run_warmup, daemon=True).start()
 
 
 # ── Health ──────────────────────────────────────────────────────────────
@@ -323,7 +342,17 @@ def _get_whisperx_aligner(language: str):
     of the wav2vec2 weights, no GPU OOM spike), while concurrent calls
     for *different* languages still parallelise.
     """
+    import re
     lang = (language or "en").lower()
+
+    # Validate the language code before creating any per-language state.
+    # Arbitrary strings would cause unbounded growth in
+    # _whisperx_aligner_locks / warmup_aligners — reject codes that
+    # aren't simple ISO 639-1/2 tags (2–8 lowercase ASCII alpha).
+    # whisperx.load_align_model() accepts only these short codes; full
+    # BCP-47 tags with hyphens (e.g. 'zh-Hans-CN') are not supported.
+    if not re.fullmatch(r'[a-z]{2,8}', lang):
+        raise ValueError(f"Invalid language code: {lang!r}")
 
     # Fast path: already cached.
     with _whisperx_aligners_lock:
@@ -490,7 +519,7 @@ async def align_lyrics(
         try:
             clean_text = (text or "").strip()
             if not clean_text:
-                return {"error": "lyrics text is empty"}
+                return {"error": "lyrics text is empty", "_http_status": 400}
 
             # WhisperX expects a numpy float32 mono 16k array for both
             # transcription and alignment. load_audio handles the
@@ -498,11 +527,11 @@ async def align_lyrics(
             audio = whisperx.load_audio(tmp.name)
             audio_duration = float(len(audio)) / 16000.0
             if audio_duration <= 0:
-                return {"error": "audio is empty"}
+                return {"error": "audio is empty", "_http_status": 400}
 
             lines = [ln.strip() for ln in clean_text.splitlines() if ln.strip()]
             if not lines:
-                return {"error": "lyrics text is empty"}
+                return {"error": "lyrics text is empty", "_http_status": 400}
 
             # Build a flat word list with a parallel word→line index
             # array so we can recover new_line markers after alignment.
@@ -513,7 +542,7 @@ async def align_lyrics(
                     flat_words.append(w)
                     word_to_line.append(line_idx)
             if not flat_words:
-                return {"error": "lyrics text contains no words"}
+                return {"error": "lyrics text contains no words", "_http_status": 400}
 
             # Run Whisper transcription. We use it for two purposes:
             #   1. Language detection (free byproduct of the call).
@@ -551,11 +580,7 @@ async def align_lyrics(
             ]
 
             # Distribute user-text words across speech segments
-            # proportionally to each segment's duration. word_to_segment
-            # records which speech segment each input word landed in,
-            # which we use later (alongside word_to_line) to recover
-            # new_line markers after wav2vec2 align.
-            word_to_segment: list[int] = [0] * len(flat_words)
+            # proportionally to each segment's duration.
             custom_segments: list[dict] = []
 
             if not speech_segments:
@@ -613,8 +638,6 @@ async def align_lyrics(
                         # skip it. Common for very short utterances.
                         continue
                     chunk_words = flat_words[cursor:end_word_idx]
-                    for wi in range(cursor, end_word_idx):
-                        word_to_segment[wi] = len(custom_segments)
                     custom_segments.append({
                         "start": round(float(s["start"]), 3),
                         "end": round(float(s["end"]), 3),
@@ -627,9 +650,6 @@ async def align_lyrics(
                 if cursor < len(flat_words) and custom_segments:
                     trailing = flat_words[cursor:]
                     custom_segments[-1]["text"] += " " + " ".join(trailing)
-                    last_seg = len(custom_segments) - 1
-                    for wi in range(cursor, len(flat_words)):
-                        word_to_segment[wi] = last_seg
 
             if not custom_segments:
                 return {"error": "no speech segments found to align against"}
@@ -885,7 +905,8 @@ async def align_lyrics(
     result = await loop.run_in_executor(None, _do_align)
 
     if "error" in result:
-        return JSONResponse(result, 500)
+        status = result.pop("_http_status", 500)
+        return JSONResponse(result, status)
     return result
 
 
@@ -903,11 +924,12 @@ async def align_lyrics(
 #      pick the semitone with the highest summed confidence. More
 #      robust than median-Hz to a few wrong frames mid-syllable.
 #   3. Range narrowing. Compute the song-wide median midi from
-#      confident frames and clamp each per-syllable estimate to ±12
-#      semitones around that median (preferring the candidate octave
-#      that lies in range). Catches the long-tail of pYIN-style
-#      octave doublings that CREPE still occasionally produces on
-#      breathy / quiet notes.
+#      confident frames and, for each syllable, discard frames that
+#      fall outside ±12 semitones of that median — but only when
+#      ≥50 % of the syllable's confidence weight is already in range
+#      (so a legitimate high/low note is never discarded). Catches
+#      the long-tail of octave doublings that CREPE still
+#      occasionally produces on breathy / quiet notes.
 #   4. Octave-error correction against the song-wide median. If
 #      shifting a token by ±12 brings its midi closer to the song's
 #      median than the raw value, prefer the shifted one.
@@ -1395,8 +1417,6 @@ def _warmup_demucs() -> None:
     cmd = [sys.executable, run_demucs, "--download-only"]
     if _model:
         cmd.extend(["-n", _model])
-    if _device:
-        cmd.extend(["-d", _device])
     # Stream stderr/stdout straight through so demucs' tqdm is visible.
     proc = subprocess.run(cmd)
     if proc.returncode == 0:
@@ -1483,14 +1503,11 @@ def main():
     if API_KEY:
         print("  API key: enabled")
 
-    if args.skip_warmup:
-        # Mark all warmup steps as "skipped" so /health reflects the
-        # operator's choice — subsequent endpoint calls still work,
-        # they just lazy-download on demand.
-        for k in list(warmup_state.keys()):
-            _set_warmup_state(k, "skipped")
-    else:
-        threading.Thread(target=_run_warmup, daemon=True).start()
+    # Store the --skip-warmup flag on app.state so the startup hook can
+    # read it without a module-level global. The startup hook fires only
+    # after uvicorn has bound the port (making /health queryable from the
+    # very first moment the warmup thread starts).
+    app.state.skip_warmup = args.skip_warmup
 
     uvicorn.run(app, host=args.host, port=args.port)
 
