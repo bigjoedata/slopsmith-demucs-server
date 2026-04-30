@@ -78,12 +78,24 @@ async def check_api_key(request, call_next):
 
 @app.get("/health")
 def health():
+    # Probe torchcrepe lazily — it's optional, and the import is the
+    # only reliable signal of "is /pitch usable on this server".
+    try:
+        import torchcrepe  # noqa: F401
+        crepe_available = True
+    except ImportError:
+        crepe_available = False
     return {
         "status": "ok",
         "demucs_model": _model,
         "gpu": _gpu_available,
         "device": _device,
         "cache_dir": str(CACHE_DIR),
+        "endpoints": {
+            "separate": True,
+            "align": True,
+            "pitch": crepe_available,
+        },
     }
 
 
@@ -341,6 +353,243 @@ async def align_lyrics(
     loop = asyncio.get_event_loop()
     result = await loop.run_in_executor(None, _do_align)
 
+    if "error" in result:
+        return JSONResponse(result, 500)
+    return result
+
+
+# ── Per-syllable pitch extraction (CREPE) ───────────────────────────────
+#
+# /pitch returns one MIDI note per supplied syllable timing. The
+# extractor runs CREPE (a neural pitch tracker) over the vocals stem,
+# then applies four quality steps that meaningfully improve the
+# resulting karaoke chart:
+#
+#   1. CREPE itself — vastly fewer octave errors than pYIN, with a
+#      per-frame confidence that we use as the aggregation weight.
+#   2. Confidence-weighted mode-of-semitone per syllable. For each
+#      token, we round each frame's f0 to the nearest semitone and
+#      pick the semitone with the highest summed confidence. More
+#      robust than median-Hz to a few wrong frames mid-syllable.
+#   3. Range narrowing. Compute the song-wide median midi from
+#      confident frames and clamp each per-syllable estimate to ±12
+#      semitones around that median (preferring the candidate octave
+#      that lies in range). Catches the long-tail of pYIN-style
+#      octave doublings that CREPE still occasionally produces on
+#      breathy / quiet notes.
+#   4. Octave-error correction against the song-wide median. If
+#      shifting a token by ±12 brings its midi closer to the song's
+#      median than the raw value, prefer the shifted one.
+#
+# Tokens with no confident frames inside their window get their midi
+# borrowed from the nearest confident neighbour so whole phrases that
+# CREPE can't lock (whispered / spoken bridges) still produce bars.
+
+_crepe_loaded = False
+
+
+def _ensure_crepe_loaded():
+    """Lazy-import torchcrepe so the server still starts when CREPE
+    isn't installed; the /pitch endpoint will surface a clean error."""
+    global _crepe_loaded
+    if _crepe_loaded:
+        return
+    import torchcrepe  # noqa: F401  — import-time check only
+    _crepe_loaded = True
+
+
+def _crepe_device() -> str:
+    """Use the same device choice as demucs/whisper so a CUDA box runs
+    everything on the GPU and a CPU box stays on the CPU."""
+    if _device:
+        return _device
+    if _gpu_available:
+        return "cuda"
+    return "cpu"
+
+
+def _extract_pitch_with_crepe(audio_path: Path, lyrics: list[dict]) -> list[dict]:
+    """Run CREPE on the vocals stem and return one ``{t, d, midi}`` per
+    token. See module-level comment above for the four quality steps.
+    """
+    import numpy as np
+    import torch
+    import torchcrepe
+    import librosa
+
+    sr = 16000  # CREPE is trained at 16 kHz
+    y, sr = librosa.load(str(audio_path), sr=sr, mono=True)
+    if y.size == 0:
+        return []
+
+    audio = torch.from_numpy(y).unsqueeze(0).float()
+    hop_length = 160  # 10 ms frames at 16 kHz — matches CREPE's design
+    fmin = float(librosa.note_to_hz("C2"))
+    fmax = float(librosa.note_to_hz("C6"))
+    device = _crepe_device()
+
+    # CREPE's `full` model is the most accurate; `tiny` is the fastest.
+    # `full` is fine on CPU at 16 kHz for ~5 min songs (~1-2× realtime).
+    f0, periodicity = torchcrepe.predict(
+        audio,
+        sr,
+        hop_length,
+        fmin,
+        fmax,
+        model="full",
+        batch_size=2048,
+        device=device,
+        return_periodicity=True,
+    )
+    # torchcrepe applies a Viterbi-like decoder when batched; periodicity
+    # serves the role pYIN's voiced_prob played in tier 1 — a 0..1
+    # confidence per frame.
+    f0_np = f0.squeeze(0).cpu().numpy().astype(float)
+    conf_np = periodicity.squeeze(0).cpu().numpy().astype(float)
+
+    # CREPE returns 0 Hz where it failed to estimate; mask those out so
+    # log2 doesn't see them.
+    valid = (f0_np > 0) & np.isfinite(f0_np)
+    times = np.arange(f0_np.size) * (hop_length / sr)
+    n_frames = len(times)
+
+    # Pre-compute song-wide median midi from confident frames so range
+    # narrowing has a stable reference.
+    confident_mask = valid & (conf_np > 0.5)
+    if int(confident_mask.sum()) >= 32:
+        midis_all = 69 + 12 * np.log2(f0_np[confident_mask] / 440.0)
+        song_median = float(np.median(midis_all))
+        clamp_low = song_median - 12
+        clamp_high = song_median + 12
+    else:
+        song_median = None
+        clamp_low = clamp_high = None
+
+    raw: list[dict] = []
+    for tok in lyrics:
+        t0 = float(tok["t"])
+        t1 = t0 + float(tok["d"])
+        i0 = int(np.searchsorted(times, t0, side="left"))
+        i1 = int(np.searchsorted(times, t1, side="right"))
+        midi: int | None = None
+        if i1 > i0 and i0 < n_frames:
+            seg_hz = f0_np[i0:i1]
+            seg_w = conf_np[i0:i1]
+            mask = (seg_hz > 0) & np.isfinite(seg_hz) & (seg_w > 0.2)
+            if mask.any():
+                hz = seg_hz[mask]
+                w = seg_w[mask]
+                semitones = np.rint(69 + 12 * np.log2(hz / 440.0)).astype(int)
+
+                # Range narrowing: drop frames outside ±12 semitones of
+                # the song median when we have a stable reference. Keep
+                # the unclamped version too in case clamping kills every
+                # frame (legitimately out-of-range high notes).
+                if clamp_low is not None and clamp_high is not None:
+                    in_range = (semitones >= clamp_low) & (semitones <= clamp_high)
+                    if in_range.any():
+                        semitones = semitones[in_range]
+                        w = w[in_range]
+
+                # Confidence-weighted mode of semitones.
+                unique = np.unique(semitones)
+                weights = np.array(
+                    [float(w[semitones == u].sum()) for u in unique],
+                    dtype=float,
+                )
+                midi = int(unique[int(np.argmax(weights))])
+        raw.append({"t": t0, "d": float(tok["d"]), "midi": midi})
+
+    # Octave-error correction against the song-wide median. Even with
+    # CREPE's lower error rate, a quiet syllable can land an octave off
+    # the surrounding melody — snap if shifting brings it closer.
+    if song_median is not None:
+        for r in raw:
+            if r["midi"] is None:
+                continue
+            base = int(r["midi"])
+            best = base
+            best_dist = abs(base - song_median)
+            for shift in (-12, 12):
+                cand = base + shift
+                d = abs(cand - song_median)
+                if d < best_dist:
+                    best, best_dist = cand, d
+            r["midi"] = best
+
+    # Neighbour-borrow for tokens that still have no midi (consonant
+    # syllables, whispered phrases CREPE couldn't lock). Skip if the
+    # whole song produced nothing — there's nothing to borrow.
+    indexed_confident = [(i, r["midi"]) for i, r in enumerate(raw) if r["midi"] is not None]
+    if indexed_confident:
+        for i, r in enumerate(raw):
+            if r["midi"] is not None:
+                continue
+            nearest = min(indexed_confident, key=lambda c: abs(c[0] - i))
+            r["midi"] = nearest[1]
+
+    return [r for r in raw if r["midi"] is not None]
+
+
+@app.post("/pitch")
+async def pitch_extract(
+    file: UploadFile = File(...),
+    lyrics: str = Form(...),
+):
+    """Run CREPE on a vocals stem and return one MIDI note per syllable.
+
+    Body:
+      - ``file``    — vocals audio (any format librosa can read)
+      - ``lyrics``  — JSON array of ``{"t": float, "d": float}`` token
+                      timings (start / duration in seconds)
+
+    Returns ``{"notes": [{"t", "d", "midi"}, ...]}``. Tokens for which
+    no pitch could be estimated (even after neighbour-borrow) are
+    omitted from the output.
+    """
+    import json
+
+    try:
+        _ensure_crepe_loaded()
+    except ImportError:
+        return JSONResponse(
+            {"error": "torchcrepe not installed on this server — pip install torchcrepe"},
+            501,
+        )
+
+    try:
+        token_list = json.loads(lyrics)
+        if not isinstance(token_list, list):
+            raise ValueError("lyrics must be a JSON array")
+        for entry in token_list:
+            if not isinstance(entry, dict) or "t" not in entry or "d" not in entry:
+                raise ValueError("each lyric entry needs 't' and 'd'")
+    except (json.JSONDecodeError, ValueError) as exc:
+        return JSONResponse({"error": f"invalid lyrics payload: {exc}"}, 400)
+
+    if not token_list:
+        return {"notes": []}
+
+    suffix = Path(file.filename or "audio.ogg").suffix or ".ogg"
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+    content = await file.read()
+    tmp.write(content)
+    tmp.close()
+
+    def _do_extract():
+        try:
+            return {"notes": _extract_pitch_with_crepe(Path(tmp.name), token_list)}
+        except Exception as exc:  # noqa: BLE001
+            return {"error": str(exc)}
+        finally:
+            try:
+                os.unlink(tmp.name)
+            except OSError:
+                pass
+
+    import asyncio
+    loop = asyncio.get_event_loop()
+    result = await loop.run_in_executor(None, _do_extract)
     if "error" in result:
         return JSONResponse(result, 500)
     return result

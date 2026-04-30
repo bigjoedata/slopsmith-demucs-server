@@ -24,6 +24,22 @@ Forced alignment of plain text lyrics against an audio file using [Whisper](http
 - Lazy-loaded Whisper medium model with CUDA acceleration
 - Used by the [Lyrics Sync plugin](https://github.com/byrongamatos/slopsmith-plugin-lyrics-sync)
 
+### Per-syllable Pitch Extraction (`POST /pitch`)
+
+Estimates one MIDI note per syllable from a vocals stem using
+[CREPE](https://github.com/marl/crepe) via
+[torchcrepe](https://github.com/maxrmorrison/torchcrepe). Powers the
+karaoke pitch chart in the
+[Lyrics Karaoke plugin](https://github.com/byrongamatos/slopsmith-plugin-lyrics-karaoke):
+
+- CREPE neural pitch tracker — order-of-magnitude fewer octave errors than pYIN
+- Confidence-weighted mode-of-semitone aggregation per syllable
+- Song-wide range narrowing (clamps each syllable to ±12 semitones around the median)
+- Octave-error correction against the song-wide median
+- Neighbour-borrowed pitch for tokens CREPE can't lock (so whispered phrases still get bars)
+- Falls back gracefully: server returns `501` if `torchcrepe` isn't installed, and the
+  client (lyrics_karaoke) keeps working with its in-process pYIN extractor.
+
 ## Setup
 
 ### Requirements
@@ -97,6 +113,21 @@ Forced-align lyrics against audio using Whisper.
 | `granularity` | Form | `line` (default), `word`, or `syllable` |
 
 Returns: `{"segments": [{"start": 12.34, "end": 15.67, "text": "lyrics line"}, ...]}`
+
+### `POST /pitch`
+
+Per-syllable pitch extraction using CREPE.
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `file` | Form (file) | Vocals stem (any format librosa can read) |
+| `lyrics` | Form | JSON array of `{"t": float, "d": float}` — token start / duration in seconds |
+
+Returns: `{"notes": [{"t": 12.34, "d": 0.5, "midi": 64}, ...]}`. Tokens for which no
+pitch could be estimated (even after neighbour-borrow) are omitted.
+
+Returns `501` if `torchcrepe` isn't installed on the server. Clients should
+fall back to their own pYIN extractor when this endpoint is unavailable.
 
 ### `GET /download/{job_id}/{stem}`
 

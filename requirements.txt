@@ -5,3 +5,9 @@ demucs>=4.0.0
 torch>=2.0.0
 stable-ts>=2.0.0
 pyphen>=0.14.0
+# /pitch endpoint — optional. Install to enable CREPE-based per-syllable
+# pitch extraction for the lyrics_karaoke plugin. The endpoint surfaces
+# a clean 501 if torchcrepe isn't available, so leaving it uninstalled
+# keeps the server functional for separation + alignment only.
+torchcrepe>=0.0.20
+librosa>=0.10.0
