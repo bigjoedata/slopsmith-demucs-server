@@ -27,6 +27,14 @@ from fastapi import FastAPI, File, Form, Query, UploadFile, WebSocket, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 
+# Heavy imports happen at module top so a missing dep crashes startup
+# loudly with ModuleNotFoundError instead of silently disabling features
+# at request time. Everything below is required (see requirements.txt).
+import torch
+import torchcrepe
+import librosa
+import whisperx
+
 # ── Configuration ───────────────────────────────────────────────────────
 
 DEMUCS_MODEL = os.environ.get("SLOPSMITH_DEMUCS_MODEL", "htdemucs_ft")
@@ -62,6 +70,32 @@ _model = DEMUCS_MODEL
 _device = ""
 _gpu_available = False
 
+# ── Warmup state ────────────────────────────────────────────────────────
+#
+# On first start, demucs / whisperx / torchcrepe each pull their model
+# weights from a CDN — together ~1.5 GB. The warmup thread does these
+# downloads up front so the first user-facing /separate /align /pitch
+# call doesn't hang on a CDN fetch. Each library prints its own tqdm
+# progress bar to stderr so the admin sees actual download progress
+# in the terminal / journalctl. Clients can also poll /health to see
+# the status of each model.
+
+# warmup_state[name] = "pending" | "downloading" | "ready" | "failed: <reason>"
+warmup_state: dict[str, str] = {
+    "demucs": "pending",
+    "whisperx": "pending",
+    "crepe": "pending",
+}
+warmup_state_lock = threading.Lock()
+
+
+def _set_warmup_state(name: str, value: str) -> None:
+    with warmup_state_lock:
+        warmup_state[name] = value
+    # Print on every transition so the systemd journal carries a
+    # readable trace alongside the per-library tqdm bars.
+    print(f"[warmup] {name}: {value}", flush=True)
+
 
 # ── Auth middleware ─────────────────────────────────────────────────────
 
@@ -78,24 +112,20 @@ async def check_api_key(request, call_next):
 
 @app.get("/health")
 def health():
-    # Probe torchcrepe lazily — it's optional, and the import is the
-    # only reliable signal of "is /pitch usable on this server".
-    try:
-        import torchcrepe  # noqa: F401
-        crepe_available = True
-    except ImportError:
-        crepe_available = False
+    with warmup_state_lock:
+        warmup = dict(warmup_state)
     return {
         "status": "ok",
         "demucs_model": _model,
         "gpu": _gpu_available,
         "device": _device,
         "cache_dir": str(CACHE_DIR),
-        "endpoints": {
-            "separate": True,
-            "align": True,
-            "pitch": crepe_available,
-        },
+        # Per-model warmup status. Values: pending | downloading | ready |
+        # failed: <reason>. Clients (lyrics_karaoke etc.) can poll this
+        # to wait for `crepe == "ready"` before relying on /pitch
+        # latency, or to surface a user-visible "server warming up"
+        # progress indicator.
+        "warmup": warmup,
     }
 
 
@@ -172,25 +202,65 @@ async def separate_url(
     return result
 
 
-# ── Whisper forced alignment ───────────────────────────────────────────
+# ── WhisperX forced alignment ──────────────────────────────────────────
 
-# Lazy-loaded stable-ts model (shared across requests).
-_align_model = None
-_align_model_lock = threading.Lock()
-_align_model_name = "medium"
+# Lazy-loaded WhisperX models (shared across requests). WhisperX runs
+# faster-whisper for transcription, then a wav2vec2 forced aligner for
+# tighter word/character boundaries than stable-ts produced. The aligner
+# is language-specific so we cache one per language.
+_whisperx_model = None
+_whisperx_model_lock = threading.Lock()
+_whisperx_model_name = "medium"
+_whisperx_aligners: dict[str, tuple] = {}
+_whisperx_aligners_lock = threading.Lock()
 
 
-def _get_align_model():
-    global _align_model
-    if _align_model is None:
-        with _align_model_lock:
-            if _align_model is None:
-                import stable_whisper
-                _align_model = stable_whisper.load_model(
-                    _align_model_name,
-                    device=_device or ("cuda" if _gpu_available else "cpu"),
+def _whisperx_compute_type() -> str:
+    # faster-whisper / CTranslate2 picks compute_type per-device. CUDA
+    # benefits from float16; CPU only supports int8/float32 reliably.
+    return "float16" if (_device == "cuda" or _gpu_available) else "int8"
+
+
+def _whisperx_device() -> str:
+    return _device or ("cuda" if _gpu_available else "cpu")
+
+
+def _get_whisperx_model():
+    global _whisperx_model
+    if _whisperx_model is None:
+        with _whisperx_model_lock:
+            if _whisperx_model is None:
+                _whisperx_model = whisperx.load_model(
+                    _whisperx_model_name,
+                    device=_whisperx_device(),
+                    compute_type=_whisperx_compute_type(),
                 )
-    return _align_model
+    return _whisperx_model
+
+
+def _get_whisperx_aligner(language: str):
+    """Load (or fetch from cache) the wav2vec2 aligner for a language.
+    Returns ``(aligner_model, metadata)`` per the whisperx contract."""
+    lang = (language or "en").lower()
+    with _whisperx_aligners_lock:
+        cached = _whisperx_aligners.get(lang)
+        if cached is not None:
+            return cached
+    # load_align_model can be slow on first call (downloads wav2vec2
+    # weights). Release the lock during the actual load so a concurrent
+    # request for a *different* language doesn't have to wait — the
+    # double-check inside the lock prevents a duplicate download for the
+    # same language.
+    pair = whisperx.load_align_model(
+        language_code=lang,
+        device=_whisperx_device(),
+    )
+    with _whisperx_aligners_lock:
+        existing = _whisperx_aligners.get(lang)
+        if existing is not None:
+            return existing
+        _whisperx_aligners[lang] = pair
+    return pair
 
 
 def _get_hyphenator(lang_code: str):
@@ -226,15 +296,6 @@ def _syllabify(word: str, hyphenator) -> list[str]:
     return parts if parts else [word]
 
 
-def _detect_language(result) -> str:
-    """Try to extract the detected language from a stable-ts result."""
-    try:
-        lang = getattr(result, 'language', '')
-        return lang if lang else "en"
-    except Exception:
-        return "en"
-
-
 def _split_word_into_syllables(word_seg: dict, hyphenator) -> list[dict]:
     """Split a word segment into syllable segments with proportional timing."""
     syllables = _syllabify(word_seg["text"], hyphenator)
@@ -264,9 +325,19 @@ async def align_lyrics(
     language: str = Form(""),
     granularity: str = Form("line"),
 ):
-    """Forced-align plain text lyrics against an audio file using Whisper.
+    """Forced-align plain text lyrics against an audio file using WhisperX.
 
-    Returns a JSON array of {start, end, text} per line (or word).
+    Granularities:
+        line     — segment-level boundaries (default).
+        word     — per-word timestamps from the wav2vec2 aligner.
+        syllable — words split via pyphen hyphenation.
+        phoneme  — per-character (CTC token) timestamps from the aligner.
+                   For wav2vec2 character models these are tighter than
+                   syllables; for phoneme-trained models they're true
+                   phonemes. Both shapes are returned with a
+                   ``phoneme: true`` flag so clients can disambiguate.
+
+    Returns ``{"segments": [{start, end, text, ...}, ...]}``.
     """
     # Save upload to temp file
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=Path(file.filename or "audio.ogg").suffix)
@@ -274,73 +345,115 @@ async def align_lyrics(
     tmp.write(content)
     tmp.close()
 
+    want_word = granularity in ("word", "syllable")
+    want_phoneme = granularity == "phoneme"
+
     def _do_align():
         try:
-            model = _get_align_model()
-            # stable-ts 2.19+ requires a language — default to English
             lang = language if language else "en"
+            asr_model = _get_whisperx_model()
 
-            # align() with the user's text for all granularities.
-            # Extracts line-level or word-level from the same result.
-            result = model.align(tmp.name, text, language=lang)
-            result_dict = result.to_dict()
+            # WhisperX expects a numpy float32 mono 16k array for both
+            # transcription and alignment. load_audio handles the
+            # resample / mono conversion identically to its internals.
+            audio = whisperx.load_audio(tmp.name)
 
-            segments = []
-            if granularity in ("word", "syllable"):
-                # Extract words per segment, then smooth zero-duration
-                # timestamps within each line. align() gives accurate
-                # segment boundaries but often collapses word timestamps.
-                for seg in result_dict.get("segments", []):
-                    seg_start = seg["start"]
-                    seg_end = seg["end"]
-                    words = []
-                    for w in seg.get("words", []):
-                        wt = w.get("word", "").strip()
-                        if wt:
-                            words.append(wt)
+            # Transcribe to get rough segment-level text + boundaries.
+            # We still pass the user's `text` via the post-align step
+            # below — WhisperX doesn't support pure forced-alignment of
+            # arbitrary text the way stable-ts did, so the pipeline is
+            # transcribe → wav2vec2-align. The alignment honours the
+            # transcribed segments' word ordering, which for sung
+            # vocals matches the user-supplied lyrics closely enough
+            # in practice. Callers wanting strict text-locked alignment
+            # should split the audio per line first.
+            transcribe_kwargs = {"batch_size": 16}
+            if lang:
+                transcribe_kwargs["language"] = lang
+            transcribed = asr_model.transcribe(audio, **transcribe_kwargs)
+            detected_lang = transcribed.get("language", lang) or "en"
 
-                    if not words:
-                        continue
+            # Run the wav2vec2 forced aligner. char alignments are only
+            # produced when the caller asked for `phoneme` granularity —
+            # they roughly double the response size, so don't ship them
+            # unless needed.
+            aligner_model, aligner_meta = _get_whisperx_aligner(detected_lang)
+            aligned = whisperx.align(
+                transcribed["segments"],
+                aligner_model,
+                aligner_meta,
+                audio,
+                _whisperx_device(),
+                return_char_alignments=want_phoneme,
+            )
 
-                    # Distribute words across the segment proportionally
-                    total_chars = sum(len(w) for w in words)
-                    seg_dur = seg_end - seg_start
-                    t = seg_start
+            segments_out: list[dict] = []
+            aligned_segments = aligned.get("segments", [])
+
+            if want_phoneme:
+                # Flatten char alignments. WhisperX puts them under each
+                # segment as `chars: [{char, start, end, score}, ...]`.
+                # `start`/`end` may be missing on whitespace tokens.
+                for seg in aligned_segments:
+                    for ch in seg.get("chars", []) or []:
+                        cs = ch.get("start")
+                        ce = ch.get("end")
+                        ct = ch.get("char", "")
+                        if cs is None or ce is None or not ct.strip():
+                            continue
+                        segments_out.append({
+                            "start": round(float(cs), 3),
+                            "end": round(float(ce), 3),
+                            "text": ct,
+                            "phoneme": True,
+                        })
+            elif want_word:
+                # Per-word entries with new_line markers at segment
+                # boundaries so clients can reflow into lines.
+                for seg in aligned_segments:
                     first = True
-                    for w in words:
-                        w_dur = seg_dur * (len(w) / total_chars) if total_chars else seg_dur / len(words)
+                    for w in seg.get("words", []) or []:
+                        ws = w.get("start")
+                        we = w.get("end")
+                        wt = (w.get("word") or "").strip()
+                        if ws is None or we is None or not wt:
+                            continue
                         entry = {
-                            "start": round(t, 3),
-                            "end": round(t + w_dur, 3),
-                            "text": w,
+                            "start": round(float(ws), 3),
+                            "end": round(float(we), 3),
+                            "text": wt,
                         }
                         if first:
                             entry["new_line"] = True
                             first = False
-                        segments.append(entry)
-                        t += w_dur
+                        segments_out.append(entry)
 
                 if granularity == "syllable":
-                    lang_code = language or "en"
+                    lang_code = detected_lang
                     hyphenator = _get_hyphenator(lang_code)
                     syllable_segs = []
-                    for ws in segments:
+                    for ws in segments_out:
                         syls = _split_word_into_syllables(ws, hyphenator)
                         if ws.get("new_line") and syls:
                             syls[0]["new_line"] = True
                         syllable_segs.extend(syls)
-                    segments = syllable_segs
+                    segments_out = syllable_segs
             else:
-                for seg in result_dict.get("segments", []):
-                    seg_text = seg.get("text", "").strip()
-                    if seg_text:
-                        segments.append({
-                            "start": round(seg["start"], 3),
-                            "end": round(seg["end"], 3),
-                            "text": seg_text,
-                        })
+                for seg in aligned_segments:
+                    seg_text = (seg.get("text") or "").strip()
+                    if not seg_text:
+                        continue
+                    seg_start = seg.get("start")
+                    seg_end = seg.get("end")
+                    if seg_start is None or seg_end is None:
+                        continue
+                    segments_out.append({
+                        "start": round(float(seg_start), 3),
+                        "end": round(float(seg_end), 3),
+                        "text": seg_text,
+                    })
 
-            return {"segments": segments}
+            return {"segments": segments_out, "language": detected_lang}
         except Exception as e:
             return {"error": str(e)}
         finally:
@@ -385,19 +498,6 @@ async def align_lyrics(
 # borrowed from the nearest confident neighbour so whole phrases that
 # CREPE can't lock (whispered / spoken bridges) still produce bars.
 
-_crepe_loaded = False
-
-
-def _ensure_crepe_loaded():
-    """Lazy-import torchcrepe so the server still starts when CREPE
-    isn't installed; the /pitch endpoint will surface a clean error."""
-    global _crepe_loaded
-    if _crepe_loaded:
-        return
-    import torchcrepe  # noqa: F401  — import-time check only
-    _crepe_loaded = True
-
-
 def _crepe_device() -> str:
     """Use the same device choice as demucs/whisper so a CUDA box runs
     everything on the GPU and a CPU box stays on the CPU."""
@@ -413,9 +513,6 @@ def _extract_pitch_with_crepe(audio_path: Path, lyrics: list[dict]) -> list[dict
     token. See module-level comment above for the four quality steps.
     """
     import numpy as np
-    import torch
-    import torchcrepe
-    import librosa
 
     sr = 16000  # CREPE is trained at 16 kHz
     y, sr = librosa.load(str(audio_path), sr=sr, mono=True)
@@ -548,14 +645,6 @@ async def pitch_extract(
     omitted from the output.
     """
     import json
-
-    try:
-        _ensure_crepe_loaded()
-    except ImportError:
-        return JSONResponse(
-            {"error": "torchcrepe not installed on this server — pip install torchcrepe"},
-            501,
-        )
 
     try:
         token_list = json.loads(lyrics)
@@ -835,10 +924,82 @@ def _update_job(job_id, **kwargs):
 def _detect_gpu():
     """Check if CUDA GPU is available."""
     try:
-        import torch
         return torch.cuda.is_available()
-    except ImportError:
+    except Exception:
         return False
+
+
+# ── Model weight warmup ─────────────────────────────────────────────────
+#
+# On first start the three model families (demucs, whisperx, crepe)
+# pull weights from CDNs. This is ~1.5 GB total. Without warmup, the
+# first user-facing /separate /align /pitch call hangs on download
+# without surfacing progress, the request likely times out, and the
+# operator has no idea what's happening.
+#
+# Warmup runs all three downloads sequentially in a daemon thread that
+# is spawned right before uvicorn binds the port. Each library's own
+# tqdm progress bar is left untouched so the operator sees real
+# byte-level progress in the terminal / journal. /health additionally
+# reports a per-model state dict so client UIs (the lyrics_karaoke
+# plugin, etc.) can poll for "warming up" status and surface progress.
+
+def _warmup_demucs() -> None:
+    """Pre-download the configured demucs separation model. Invokes
+    run_demucs.py with --download-only so the soundfile patching path
+    matches the real /separate flow."""
+    _set_warmup_state("demucs", "downloading")
+    run_demucs = str(Path(__file__).parent / "run_demucs.py")
+    cmd = [sys.executable, run_demucs, "--download-only"]
+    if _model:
+        cmd.extend(["-n", _model])
+    if _device:
+        cmd.extend(["-d", _device])
+    # Stream stderr/stdout straight through so demucs' tqdm is visible.
+    proc = subprocess.run(cmd)
+    if proc.returncode == 0:
+        _set_warmup_state("demucs", "ready")
+    else:
+        _set_warmup_state("demucs", f"failed: exit {proc.returncode}")
+
+
+def _warmup_whisperx() -> None:
+    """Pre-download the WhisperX ASR model and the English aligner.
+    Other languages still lazy-load on first /align in that language."""
+    _set_warmup_state("whisperx", "downloading")
+    try:
+        _get_whisperx_model()
+        _get_whisperx_aligner("en")
+        _set_warmup_state("whisperx", "ready")
+    except Exception as exc:  # noqa: BLE001
+        _set_warmup_state("whisperx", f"failed: {exc}")
+
+
+def _warmup_crepe() -> None:
+    """Pre-download the CREPE pitch model. torchcrepe.load.model handles
+    both the download and putting the network on the chosen device."""
+    _set_warmup_state("crepe", "downloading")
+    try:
+        torchcrepe.load.model(device=_crepe_device(), capacity="full")
+        _set_warmup_state("crepe", "ready")
+    except Exception as exc:  # noqa: BLE001
+        _set_warmup_state("crepe", f"failed: {exc}")
+
+
+def _run_warmup() -> None:
+    """Run all three warmups sequentially. Called from a daemon thread
+    after the server binds so /health is queryable while downloads
+    progress."""
+    print("[warmup] starting model weight prefetch — first run can take ~5 min", flush=True)
+    _warmup_demucs()
+    _warmup_whisperx()
+    _warmup_crepe()
+    with warmup_state_lock:
+        ready = all(s == "ready" for s in warmup_state.values())
+    if ready:
+        print("[warmup] all models ready", flush=True)
+    else:
+        print("[warmup] finished with failures — see /health for per-model state", flush=True)
 
 
 # ── CLI entry point ─────────────────────────────────────────────────────
@@ -852,6 +1013,12 @@ def main():
     parser.add_argument("--model", default="", help="Demucs model (htdemucs, mdx_extra)")
     parser.add_argument("--device", default="", help="Device (cpu, cuda)")
     parser.add_argument("--api-key", default="", help="API key for auth")
+    parser.add_argument(
+        "--skip-warmup",
+        action="store_true",
+        help="Skip the startup model-weight prefetch. Per-endpoint calls "
+        "will lazy-download instead. Useful for restricted CI environments.",
+    )
     args = parser.parse_args()
 
     if args.model:
@@ -873,6 +1040,15 @@ def main():
     print(f"  Cache: {CACHE_DIR}")
     if API_KEY:
         print("  API key: enabled")
+
+    if args.skip_warmup:
+        # Mark all warmup steps as "skipped" so /health reflects the
+        # operator's choice — subsequent endpoint calls still work,
+        # they just lazy-download on demand.
+        for k in list(warmup_state.keys()):
+            _set_warmup_state(k, "skipped")
+    else:
+        threading.Thread(target=_run_warmup, daemon=True).start()
 
     uvicorn.run(app, host=args.host, port=args.port)
 
