@@ -380,6 +380,13 @@ def _get_whisperx_aligner(language: str):
         _set_aligner_state(lang, "ready")
         for el in evicted_langs:
             _set_aligner_state(el, "evicted")
+            # Top-level whisperx state tracks "ASR + en aligner". If
+            # the en aligner is evicted, that contract no longer holds
+            # — clients polling /health.warmup.whisperx must see this
+            # to avoid blasting requests at a server that'll re-stall
+            # on en's CDN fetch on next /align.
+            if el == "en":
+                _set_warmup_state("whisperx", "evicted")
         # Best-effort GPU memory release after eviction. Safe to call
         # on CPU (no-op).
         if evicted_langs:
@@ -774,22 +781,42 @@ async def align_lyrics(
                             float(bucket[-1]["end"]),
                         )
 
-                # If alignment produced zero usable timings for ANY line,
-                # there's no anchor to interpolate from — every "estimate"
-                # would be fabricated 0..audio_duration nonsense. That's
-                # plausible-looking but unusable data; surface a real
-                # error instead. Possible causes: vocals stem is silent
-                # / pure noise, alignment language mismatch, audio
-                # corruption. Caller can retry with a different language
-                # hint or a cleaner stem.
+                # If no line got mapped via word_to_line but we DID get
+                # aligned words from wav2vec2, the failure is line-
+                # mapping (tokenization mismatch — CJK/Thai without
+                # spaces, contractions split or merged differently
+                # than ln.split() produces). Fall back to distributing
+                # the aligned-word timestamps across user lines by
+                # word-count ratio so we still produce a usable chart.
+                # Only error out when wav2vec2 itself returned no
+                # aligned words at all (genuinely unreadable / silent
+                # / language-mismatched).
                 if not any(lt is not None for lt in line_times):
-                    return {
-                        "error": (
-                            "wav2vec2 alignment produced no word timestamps "
-                            "— vocals stem may be silent, language mismatched, "
-                            "or audio unreadable"
+                    if not aligned_words:
+                        return {
+                            "error": (
+                                "wav2vec2 alignment produced no word "
+                                "timestamps — vocals stem may be silent, "
+                                "language mismatched, or audio unreadable"
+                            )
+                        }
+                    # Word-mapping fell through; spread the available
+                    # aligned word timestamps across user lines by
+                    # index ratio. Each line i gets words in the slice
+                    # [i * N / L, (i+1) * N / L) where N is aligned
+                    # word count and L is line count.
+                    n_aw = len(aligned_words)
+                    n_lines = len(lines)
+                    for li in range(n_lines):
+                        i0 = (li * n_aw) // n_lines
+                        i1 = ((li + 1) * n_aw) // n_lines
+                        if i1 <= i0:
+                            continue
+                        bucket_words = aligned_words[i0:i1]
+                        line_times[li] = (
+                            float(bucket_words[0]["start"]),
+                            float(bucket_words[-1]["end"]),
                         )
-                    }
 
                 # Fill missing lines by interpolating between known
                 # neighbours. Runs of consecutive missing lines split
