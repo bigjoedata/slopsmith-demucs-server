@@ -213,6 +213,26 @@ _whisperx_model_lock = threading.Lock()
 _whisperx_model_name = "medium"
 _whisperx_aligners: dict[str, tuple] = {}
 _whisperx_aligners_lock = threading.Lock()
+# Per-language locks so a /align call for language A doesn't block a
+# concurrent /align for language B, while two concurrent calls for the
+# SAME language serialise on a single download/load. Without this,
+# the previous "release the cache lock during load_align_model" pattern
+# allowed both threads to slip past the cache miss and double-download
+# the same wav2vec2 weights (latency spike, possible GPU OOM).
+_whisperx_aligner_locks: dict[str, threading.Lock] = {}
+_whisperx_aligner_locks_guard = threading.Lock()
+
+
+def _get_aligner_load_lock(lang: str) -> threading.Lock:
+    """Return the lock that serialises load_align_model calls for one
+    language. Created lazily; never removed (per-language locks are
+    cheap and the language set is bounded)."""
+    with _whisperx_aligner_locks_guard:
+        lock = _whisperx_aligner_locks.get(lang)
+        if lock is None:
+            lock = threading.Lock()
+            _whisperx_aligner_locks[lang] = lock
+    return lock
 
 
 def _whisperx_device() -> str:
@@ -263,28 +283,40 @@ def _get_whisperx_model():
 
 def _get_whisperx_aligner(language: str):
     """Load (or fetch from cache) the wav2vec2 aligner for a language.
-    Returns ``(aligner_model, metadata)`` per the whisperx contract."""
+    Returns ``(aligner_model, metadata)`` per the whisperx contract.
+
+    Per-language locking ensures two concurrent /align calls for the
+    same fresh language serialise on one download (no double-instantiate
+    of the wav2vec2 weights, no GPU OOM spike), while concurrent calls
+    for *different* languages still parallelise.
+    """
     lang = (language or "en").lower()
+
+    # Fast path: already cached.
     with _whisperx_aligners_lock:
         cached = _whisperx_aligners.get(lang)
+    if cached is not None:
+        _mark_lazy_loaded("whisperx")
+        return cached
+
+    # Slow path: serialise on the per-language lock so only one thread
+    # actually runs load_align_model for a given language at a time.
+    load_lock = _get_aligner_load_lock(lang)
+    with load_lock:
+        # Re-check under the load lock — a sibling thread may have
+        # populated the cache while we were waiting.
+        with _whisperx_aligners_lock:
+            cached = _whisperx_aligners.get(lang)
         if cached is not None:
             _mark_lazy_loaded("whisperx")
             return cached
-    # load_align_model can be slow on first call (downloads wav2vec2
-    # weights). Release the lock during the actual load so a concurrent
-    # request for a *different* language doesn't have to wait — the
-    # double-check inside the lock prevents a duplicate download for the
-    # same language.
-    pair = whisperx.load_align_model(
-        language_code=lang,
-        device=_whisperx_device(),
-    )
-    with _whisperx_aligners_lock:
-        existing = _whisperx_aligners.get(lang)
-        if existing is not None:
-            _mark_lazy_loaded("whisperx")
-            return existing
-        _whisperx_aligners[lang] = pair
+        pair = whisperx.load_align_model(
+            language_code=lang,
+            device=_whisperx_device(),
+        )
+        with _whisperx_aligners_lock:
+            _whisperx_aligners[lang] = pair
+
     _mark_lazy_loaded("whisperx")
     return pair
 
@@ -456,20 +488,45 @@ async def align_lyrics(
                     "text": " ".join(flat_words),
                 })
             else:
-                total_dur = sum(
-                    float(s["end"]) - float(s["start"])
+                # Distribute user-text words across speech segments by
+                # the number of words Whisper transcribed in each
+                # segment, NOT by segment duration. Words-per-second
+                # varies wildly within a song (sustained ballad lines
+                # vs. fast chorus), so duration-weighting can land
+                # whole phrases in the wrong segment. Whisper's own
+                # transcribed word count per segment reflects the
+                # actual local tempo: a long held note shows up as
+                # one transcribed word in a long segment, a fast run
+                # shows up as many words in a short segment. Using
+                # that as the weight keeps the user→segment mapping
+                # tempo-aware.
+                #
+                # Fallback to duration weighting if transcription text
+                # is sparse / empty (Whisper sometimes returns segments
+                # with timing but no text on noisy stems).
+                transcribed_word_counts = [
+                    len((s.get("text") or "").split())
                     for s in speech_segments
-                ) or audio_duration
+                ]
+                total_transcribed_words = sum(transcribed_word_counts)
 
-                # Cumulative end-word index per speech segment, weighted
-                # by duration. Pin the last entry to len(flat_words) so
-                # rounding error doesn't drop trailing words.
                 cumulative: list[int] = []
                 running = 0.0
-                for s in speech_segments:
-                    seg_dur = float(s["end"]) - float(s["start"])
-                    running += (seg_dur / total_dur) * len(flat_words)
-                    cumulative.append(int(round(running)))
+                if total_transcribed_words > 0:
+                    for n_words in transcribed_word_counts:
+                        running += (n_words / total_transcribed_words) * len(flat_words)
+                        cumulative.append(int(round(running)))
+                else:
+                    total_dur = sum(
+                        float(s["end"]) - float(s["start"])
+                        for s in speech_segments
+                    ) or audio_duration
+                    for s in speech_segments:
+                        seg_dur = float(s["end"]) - float(s["start"])
+                        running += (seg_dur / total_dur) * len(flat_words)
+                        cumulative.append(int(round(running)))
+                # Pin the last entry to len(flat_words) so rounding
+                # error doesn't drop trailing words.
                 cumulative[-1] = len(flat_words)
 
                 cursor = 0
@@ -631,14 +688,45 @@ async def align_lyrics(
                         continue
                     line_buckets.setdefault(li, []).append(w)
 
-                for line_idx, ln in enumerate(lines):
+                # First pass: collect (start, end) for lines that have
+                # aligned words. Then fill in gaps with neighbour-based
+                # estimates so EVERY input line produces an output
+                # segment. Dropping lines silently breaks index-based
+                # clients (line N in the response no longer matches
+                # line N in the input) and de-syncs the rest of the
+                # song display. A best-effort estimate is strictly
+                # better than a missing line.
+                line_times: list[tuple[float, float] | None] = [None] * len(lines)
+                for line_idx in range(len(lines)):
                     bucket = line_buckets.get(line_idx, [])
-                    if not bucket:
-                        # No words landed in this line — emit nothing
-                        # rather than a zero-duration entry.
+                    if bucket:
+                        line_times[line_idx] = (
+                            float(bucket[0]["start"]),
+                            float(bucket[-1]["end"]),
+                        )
+
+                # Fill missing lines by interpolating between known
+                # neighbours: previous line's end → next line's start.
+                # Edges fall back to 0 / audio_duration.
+                for line_idx in range(len(lines)):
+                    if line_times[line_idx] is not None:
                         continue
-                    seg_start = float(bucket[0]["start"])
-                    seg_end = float(bucket[-1]["end"])
+                    prev_end = 0.0
+                    for j in range(line_idx - 1, -1, -1):
+                        if line_times[j] is not None:
+                            prev_end = line_times[j][1]
+                            break
+                    next_start = audio_duration
+                    for j in range(line_idx + 1, len(lines)):
+                        if line_times[j] is not None:
+                            next_start = line_times[j][0]
+                            break
+                    if next_start <= prev_end:
+                        next_start = min(audio_duration, prev_end + 0.5)
+                    line_times[line_idx] = (prev_end, next_start)
+
+                for line_idx, ln in enumerate(lines):
+                    seg_start, seg_end = line_times[line_idx]  # type: ignore[misc]
                     segments_out.append({
                         "start": round(seg_start, 3),
                         "end": round(seg_end, 3),
