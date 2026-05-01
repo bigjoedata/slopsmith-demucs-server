@@ -257,7 +257,16 @@ _whisperx_model_name = "medium"
 # accumulating dozens of ~1 GB wav2vec2 aligners would OOM. Bounded
 # by MAX_WHISPERX_ALIGNERS; the least-recently-used aligner is evicted
 # when the cap is exceeded.
-MAX_WHISPERX_ALIGNERS = max(1, int(os.environ.get("SLOPSMITH_MAX_WHISPERX_ALIGNERS", "4")))
+_MAX_WHISPERX_ALIGNERS_DEFAULT = 4
+try:
+    MAX_WHISPERX_ALIGNERS = max(1, int(os.environ.get("SLOPSMITH_MAX_WHISPERX_ALIGNERS", str(_MAX_WHISPERX_ALIGNERS_DEFAULT))))
+except (ValueError, TypeError):
+    print(
+        f"[server] WARNING: SLOPSMITH_MAX_WHISPERX_ALIGNERS is not a valid integer; "
+        f"using default ({_MAX_WHISPERX_ALIGNERS_DEFAULT})",
+        flush=True,
+    )
+    MAX_WHISPERX_ALIGNERS = _MAX_WHISPERX_ALIGNERS_DEFAULT
 _whisperx_aligners: OrderedDict[str, tuple] = OrderedDict()
 _whisperx_aligners_lock = threading.Lock()
 # Per-language locks so a /align call for language A doesn't block a
@@ -406,6 +415,17 @@ def _get_whisperx_aligner(language: str):
             while len(_whisperx_aligners) > MAX_WHISPERX_ALIGNERS:
                 old_lang, _old_pair = _whisperx_aligners.popitem(last=False)
                 evicted_langs.append(old_lang)
+        # Also evict the per-language load locks for evicted languages.
+        # Threads already holding a reference to those lock objects are
+        # unaffected; new threads for a re-requested language will simply
+        # create a fresh lock in _get_aligner_load_lock(). This bounds
+        # _whisperx_aligner_locks to MAX_WHISPERX_ALIGNERS entries so
+        # a flood of distinct (but syntactically valid) language codes
+        # can't cause unbounded memory growth.
+        if evicted_langs:
+            with _whisperx_aligner_locks_guard:
+                for el in evicted_langs:
+                    _whisperx_aligner_locks.pop(el, None)
         _set_aligner_state(lang, "ready")
         for el in evicted_langs:
             _set_aligner_state(el, "evicted")
@@ -506,6 +526,12 @@ async def align_lyrics(
 
     Returns ``{"segments": [{start, end, text, ...}, ...]}``.
     """
+    valid_granularities = {"line", "word", "syllable", "phoneme"}
+    if granularity not in valid_granularities:
+        return JSONResponse(
+            {"error": f"granularity must be one of {sorted(valid_granularities)!r}, got {granularity!r}"},
+            status_code=400,
+        )
     # Save upload to temp file
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=Path(file.filename or "audio.ogg").suffix)
     content = await file.read()
@@ -1115,10 +1141,14 @@ async def pitch_extract(
             # (e.g. {"t": "abc"}) returns a clean 400 instead of a 500
             # from the worker thread when float() blows up.
             try:
-                float(entry["t"])
-                float(entry["d"])
+                t_val = float(entry["t"])
+                d_val = float(entry["d"])
             except (TypeError, ValueError) as exc:
                 raise ValueError(f"'t' and 'd' must be numeric ({exc})")
+            if t_val < 0:
+                raise ValueError(f"'t' must be >= 0, got {t_val!r}")
+            if d_val <= 0:
+                raise ValueError(f"'d' must be > 0, got {d_val!r}")
     except (json.JSONDecodeError, ValueError) as exc:
         return JSONResponse({"error": f"invalid lyrics payload: {exc}"}, 400)
 
