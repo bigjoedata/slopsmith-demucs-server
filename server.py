@@ -12,6 +12,7 @@ Usage:
 import argparse
 import hashlib
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -444,7 +445,7 @@ def _get_whisperx_aligner(language: str):
         # on CPU (no-op).
         if evicted_langs:
             try:
-                if _whisperx_device() == "cuda":
+                if _whisperx_device().startswith("cuda"):
                     torch.cuda.empty_cache()
             except Exception:
                 pass
@@ -593,7 +594,10 @@ async def align_lyrics(
             asr_model = _get_whisperx_model()
             transcribe_kwargs: dict = {"batch_size": 16}
             if language:
-                transcribe_kwargs["language"] = language.lower()
+                normalized_lang = language.strip().lower()
+                if not re.fullmatch(r'[a-z]{2,8}', normalized_lang):
+                    raise ValueError(f"Invalid language code: {normalized_lang!r}")
+                transcribe_kwargs["language"] = normalized_lang
             transcribed = asr_model.transcribe(audio, **transcribe_kwargs)
             # Caller's explicit hint takes precedence — Whisper's auto-
             # detection can mis-classify on short clips, instrumental
@@ -994,6 +998,7 @@ def _extract_pitch_with_crepe(audio_path: Path, lyrics: list[dict]) -> list[dict
     y, sr = librosa.load(str(audio_path), sr=sr, mono=True)
     if y.size == 0:
         return []
+    audio_duration = float(len(y)) / sr
 
     audio = torch.from_numpy(y).unsqueeze(0).float()
     hop_length = 160  # 10 ms frames at 16 kHz — matches CREPE's design
@@ -1105,10 +1110,13 @@ def _extract_pitch_with_crepe(audio_path: Path, lyrics: list[dict]) -> list[dict
     # Neighbour-borrow for tokens that still have no midi (consonant
     # syllables, whispered phrases CREPE couldn't lock). Skip if the
     # whole song produced nothing — there's nothing to borrow.
+    # Only borrow for tokens whose start time falls within the audio;
+    # out-of-range tokens (t beyond audio_duration) remain None and
+    # are filtered out below.
     indexed_confident = [(i, r["midi"]) for i, r in enumerate(raw) if r["midi"] is not None]
     if indexed_confident:
         for i, r in enumerate(raw):
-            if r["midi"] is not None:
+            if r["midi"] is not None or r["t"] >= audio_duration:
                 continue
             nearest = min(indexed_confident, key=lambda c: abs(c[0] - i))
             r["midi"] = nearest[1]
