@@ -78,7 +78,8 @@ Options:
 On first start the server pre-downloads the model weights for all
 three endpoints so the first user-facing request doesn't stall on a
 CDN fetch. Total download is **~1.5 GB** (htdemucs_ft, Whisper medium,
-CREPE full, wav2vec2-base for the active language).
+CREPE full, English wav2vec2 aligner). Aligners for other languages
+download on the first `/align` call that uses that language.
 
 The download runs in a background thread started from the FastAPI
 startup hook, so it fires only after the server has bound the port —

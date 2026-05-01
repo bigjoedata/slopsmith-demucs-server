@@ -1451,8 +1451,9 @@ def _detect_gpu():
 
 def _warmup_demucs() -> None:
     """Pre-download the configured demucs separation model. Invokes
-    run_demucs.py with --download-only so the soundfile patching path
-    matches the real /separate flow."""
+    run_demucs.py with --download-only, which calls
+    demucs.pretrained.get_model() to trigger the torch.hub weight
+    download and then exits (no audio separation is performed)."""
     _set_warmup_state("demucs", "downloading")
     run_demucs = str(Path(__file__).parent / "run_demucs.py")
     cmd = [sys.executable, run_demucs, "--download-only"]
