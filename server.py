@@ -157,6 +157,19 @@ def health():
     # languages have been loaded so non-English /align callers can
     # poll for their own language before issuing a real request.
     warmup["whisperx_aligners"] = aligners
+    # Sanitize warmup values before returning: replace any
+    # "failed: <detail>" string with the plain token "failed".
+    # The detailed exception message (which may contain internal paths
+    # or URLs) is already written to the server log by the warmup
+    # functions; it must not be surfaced to unauthenticated callers
+    # via the /health endpoint.
+    def _sanitize(v):
+        if isinstance(v, str) and v.startswith("failed:"):
+            return "failed"
+        if isinstance(v, dict):
+            return {k: _sanitize(val) for k, val in v.items()}
+        return v
+    sanitized_warmup = _sanitize(warmup)
     return {
         "status": "ok",
         "demucs_model": _model,
@@ -164,11 +177,10 @@ def health():
         "device": _device,
         "cache_dir": str(CACHE_DIR),
         # Per-model warmup status. Values: pending | downloading | ready |
-        # failed: <reason>. Clients (lyrics_karaoke etc.) can poll this
-        # to wait for `crepe == "ready"` before relying on /pitch
-        # latency, or to surface a user-visible "server warming up"
-        # progress indicator.
-        "warmup": warmup,
+        # failed. Clients (lyrics_karaoke etc.) can poll this to wait for
+        # `crepe == "ready"` before relying on /pitch latency, or to
+        # surface a user-visible "server warming up" progress indicator.
+        "warmup": sanitized_warmup,
     }
 
 
@@ -356,7 +368,6 @@ def _get_whisperx_aligner(language: str):
     of the wav2vec2 weights, no GPU OOM spike), while concurrent calls
     for *different* languages still parallelise.
     """
-    import re
     lang = (language or "en").lower()
 
     # Validate the language code before creating any per-language state.
@@ -603,7 +614,13 @@ async def align_lyrics(
             # detection can mis-classify on short clips, instrumental
             # intros, or non-English vocals, which would then load the
             # wrong wav2vec2 aligner.
-            detected_lang = (language or transcribed.get("language") or "en").lower()
+            # Use the already-normalised value (strip+lower) when the
+            # caller supplied a language hint, so detected_lang is always
+            # clean before passing to _get_whisperx_aligner().
+            detected_lang = (
+                normalized_lang if language
+                else (transcribed.get("language") or "en").lower()
+            )
             raw_speech_segments = transcribed.get("segments", []) or []
 
             # Drop tiny / zero-duration segments — wav2vec2 align tends
