@@ -1120,7 +1120,7 @@ def _extract_pitch_with_crepe(audio_path: Path, lyrics: list[dict]) -> list[dict
     # For each token, look at the nearest confident neighbours (a few
     # tokens before and after) and snap to a ±12 shift only when the
     # shift brings the note meaningfully closer to that local
-    # neighbourhood. Requires a margin of ≥3 semitones improvement so
+    # neighbourhood. Requires a margin of ≥6 semitones improvement so
     # legitimate jumps (a real octave leap) aren't snapped flat.
     raw_midis: list[int | None] = [r["midi"] for r in raw]
     NEIGHBOUR_RADIUS = 3
@@ -1179,7 +1179,7 @@ def _extract_pitch_with_crepe(audio_path: Path, lyrics: list[dict]) -> list[dict
         for shift in (-12, 12):
             cand = base + shift
             d = abs(cand - local_centre)
-            if d + SNAP_IMPROVEMENT < best_dist:
+            if d + SNAP_IMPROVEMENT <= best_dist:
                 best, best_dist = cand, d
         r["midi"] = best
 
