@@ -2,6 +2,10 @@
 
 torchaudio >= 2.11 requires torchcodec for saving, which has shared library issues.
 This wrapper patches demucs.audio.save_audio to use soundfile directly.
+
+Also supports a ``--download-only`` mode that loads the requested model
+(triggering its CDN download via torch.hub) and then exits without
+running separation. Used by server.py's startup warmup.
 """
 
 import sys
@@ -32,6 +36,35 @@ def patched_save_audio(wav, path, samplerate=44100, bitrate=320, clip="rescale",
 # Patch demucs before importing its main
 import demucs.audio
 demucs.audio.save_audio = patched_save_audio
+
+
+def _download_only() -> int:
+    """Load the requested model (downloading via torch.hub if needed),
+    then exit. Args mirror the subset of demucs.separate flags we use:
+    -n MODEL.
+    """
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--download-only", action="store_true")
+    parser.add_argument("-n", "--name", default="htdemucs_ft")
+    args, _unknown = parser.parse_known_args()
+
+    # demucs.pretrained.get_model() is the stable cross-version API on
+    # demucs >= 4.0.0; it triggers the torch.hub weights download to
+    # the standard cache and returns the loaded model object.
+    # Note: demucs.api.Separator is intentionally avoided — that module
+    # is absent in some demucs 4.0.x wheels, so get_model() is used
+    # here for maximum compatibility while still exercising the same
+    # torch.hub download path used by real /separate jobs.
+    from demucs.pretrained import get_model
+    print(f"[run_demucs] Pre-downloading {args.name} weights...", flush=True)
+    get_model(args.name)
+    print(f"[run_demucs] {args.name} ready.", flush=True)
+    return 0
+
+
+if "--download-only" in sys.argv:
+    sys.exit(_download_only())
 
 # Now run demucs main
 from demucs.separate import main
