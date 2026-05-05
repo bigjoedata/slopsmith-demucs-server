@@ -41,6 +41,22 @@ from fastapi.responses import FileResponse, JSONResponse
 # loudly with ModuleNotFoundError instead of silently disabling features
 # at request time. Everything below is required (see requirements.txt).
 import torch
+
+# PyTorch ≥2.6 changed the default for weights_only to True, which breaks
+# legacy checkpoints used by torchaudio pipelines (wav2vec2 aligner) and
+# demucs states. Force weights_only=False for all torch.load calls — every
+# checkpoint loaded here comes from a trusted ML source (torchaudio CDN,
+# demucs hub, HuggingFace). Must be applied before any model-library import
+# so that callers that explicitly pass weights_only=True are also covered.
+import inspect as _inspect
+_orig_torch_load = torch.load
+_torch_load_has_weights_only = "weights_only" in _inspect.signature(_orig_torch_load).parameters
+def _torch_load_compat(f, map_location=None, pickle_module=None, *, weights_only=False, **kwargs):
+    if _torch_load_has_weights_only:
+        kwargs["weights_only"] = False
+    return _orig_torch_load(f, map_location=map_location, pickle_module=pickle_module, **kwargs)
+torch.load = _torch_load_compat
+
 import torchcrepe
 import librosa
 import whisperx
