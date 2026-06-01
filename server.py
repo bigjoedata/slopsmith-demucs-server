@@ -1638,8 +1638,21 @@ def _run_warmup() -> None:
 def main():
     global _model, _device, _gpu_available, API_KEY
 
+    # Parse and validate the PORT environment variable safely
+    raw_port = os.environ.get("PORT")
+    default_port = 8000
+    if raw_port:
+        try:
+            default_port = int(raw_port)
+        except ValueError:
+            print(
+                f"Error: Invalid non-numeric value for PORT environment variable '{raw_port}'. "
+                "Falling back to default port 8000.",
+                file=sys.stderr,
+            )
+
     parser = argparse.ArgumentParser(description="Slopsmith Demucs Separation Service")
-    parser.add_argument("--port", type=int, default=7865, help="Port to listen on")
+    parser.add_argument("--port", type=int, default=default_port, help="Port to listen on")
     parser.add_argument("--host", default="0.0.0.0", help="Host to bind to")
     parser.add_argument("--model", default="", help="Demucs model (htdemucs, mdx_extra)")
     parser.add_argument("--device", default="", help="Device (cpu, cuda)")
