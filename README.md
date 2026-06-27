@@ -10,8 +10,12 @@ Splits audio into individual stems using [Demucs](https://github.com/facebookres
 
 - Default model: **`htdemucs_ft`** (4-stem fine-tuned: drums, bass, vocals, other)
 - Other models selectable per-request: `htdemucs_6s` (6-stem incl. guitar/piano), `mdx_extra` (lighter)
+- **`bs_roformer_sw`** — BS-Roformer-SW (6-stem: vocals/drums/bass/guitar/piano/other), via
+  [audio-separator](https://github.com/nomadkaraoke/python-audio-separator). Higher SDR than
+  Demucs (notably bass/guitar) with far less cross-stem bleed; checkpoint (~700 MB) lazy-downloads
+  on first use to `<cache>/_roformer-models/`. Stems returned as lossless FLAC.
 - File upload or URL input
-- Per-stem caching (avoids re-processing)
+- Per-stem caching, keyed by audio **and model** (avoids re-processing; same song under two models caches separately)
 - WebSocket progress updates
 
 ### Lyrics Alignment (`POST /align`)

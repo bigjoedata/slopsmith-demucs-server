@@ -87,6 +87,44 @@ CACHE_MAX_COMPLETED_JOBS = _parse_cache_max_completed_jobs(
     os.environ.get("SLOPSMITH_DEMUCS_CACHE_MAX_JOBS")
 )
 
+# ── Separation model registry ───────────────────────────────────────────
+#
+# Two separation backends share the /separate surface, chosen per-request
+# by the `model` query param:
+#   • Demucs models (htdemucs_ft, htdemucs_6s, mdx_extra) run through
+#     run_demucs.py (torch.hub weights).
+#   • Roformer / MDXC models run through run_roformer.py (audio-separator).
+#
+# ROFORMER_MODELS maps the public model name a client sends to the
+# audio-separator checkpoint filename. Anything not listed here is treated
+# as a Demucs model name and passed straight to demucs.
+ROFORMER_MODELS = {
+    # public name      -> audio-separator checkpoint filename
+    "bs_roformer_sw": "BS-Roformer-SW.ckpt",  # 6-stem: vocals/drums/bass/guitar/piano/other
+}
+
+# Roformer checkpoints are cached here (separate from torch.hub's demucs
+# cache) so they survive restarts instead of re-downloading to /tmp.
+ROFORMER_MODEL_DIR = CACHE_DIR / "_roformer-models"
+
+
+def _is_roformer_model(model: str) -> bool:
+    return model in ROFORMER_MODELS
+
+
+def _job_id_for(audio_hash: str, model: str) -> str:
+    """Build a cache key from the audio hash AND the model.
+
+    The cache (folder name, jobs-table key, and /download path) is keyed by
+    this id. Folding the model in keeps separations by different models on the
+    same audio from colliding — e.g. the same song separated by htdemucs vs
+    BS-Roformer-SW must cache as two distinct entries, otherwise an A/B request
+    would be served the other model's stems. Slug is sanitized to the
+    CACHE_JOB_ID_RE charset.
+    """
+    slug = re.sub(r"[^A-Za-z0-9]+", "-", model).strip("-").lower() or "default"
+    return f"{audio_hash}-{slug}"
+
 # ── State ───────────────────────────────────────────────────────────────
 
 app = FastAPI(title="Slopsmith Demucs Server")
@@ -127,10 +165,17 @@ _gpu_available = False
 
 # warmup_state[name] = "pending" | "downloading" | "ready" | "failed: <reason>"
 #                    | "skipped" (--skip-warmup) | "evicted" (LRU aligner evicted)
+# The three core models are pre-warmed at startup and gate the "all ready"
+# log. bs_roformer_sw is an optional, per-request separator: it is NOT
+# pre-downloaded (it would add ~700 MB to the mandatory boot fetch), so it
+# stays "pending" until the first Roformer /separate lazy-loads it, then
+# flips to "ready". It is excluded from the startup readiness check below.
+CORE_WARMUP_MODELS = ("demucs", "whisperx", "crepe")
 warmup_state: dict[str, str] = {
     "demucs": "pending",
     "whisperx": "pending",
     "crepe": "pending",
+    "bs_roformer_sw": "pending",
 }
 warmup_state_lock = threading.Lock()
 
@@ -243,9 +288,9 @@ async def separate_upload(
     tmp.write(content)
     tmp.close()
 
-    # Hash for cache key
+    # Hash for cache key (model-aware so demucs vs Roformer don't collide)
     audio_hash = hashlib.sha256(content).hexdigest()[:16]
-    job_id = audio_hash
+    job_id = _job_id_for(audio_hash, use_model)
 
     # Check cache
     cached = _check_cache(job_id, stem_list, use_model)
@@ -275,9 +320,9 @@ async def separate_url(
     use_model = model or _model
     stem_list = [s.strip() for s in stems.split(",") if s.strip()]
 
-    # Hash the URL for cache key
+    # Hash the URL for cache key (model-aware so demucs vs Roformer don't collide)
     audio_hash = hashlib.sha256(url.encode()).hexdigest()[:16]
-    job_id = audio_hash
+    job_id = _job_id_for(audio_hash, use_model)
 
     # Check cache
     cached = _check_cache(job_id, stem_list, use_model)
@@ -1535,8 +1580,9 @@ def _enqueue_job(job_id, audio_path, stem_list, model):
         while len(jobs) > 200:
             jobs.popitem(last=False)
 
+    runner = _run_roformer if _is_roformer_model(model) else _run_demucs
     thread = threading.Thread(
-        target=_run_demucs,
+        target=runner,
         args=(job_id, audio_path, stem_list, model),
         daemon=True,
     )
@@ -1635,6 +1681,102 @@ def _run_demucs(job_id, audio_path, stem_list, model):
             pass
 
 
+def _run_roformer(job_id, audio_path, stem_list, model):
+    """Run an audio-separator Roformer/MDXC separation in a background thread.
+
+    The Demucs analogue is _run_demucs; this mirrors its lifecycle (active
+    count, progress updates, cache copy, cleanup) but shells out to
+    run_roformer.py instead. audio-separator writes one file per stem named
+    ``<base>_(<label>)_<model>.flac``; we map those labels back to the
+    requested stem names and copy the lossless FLACs into the cache.
+    """
+    global active_count
+
+    with active_lock:
+        active_count += 1
+
+    tmp_out = tempfile.mkdtemp(prefix="roformer_out_")
+    proc = None
+    try:
+        _update_job(job_id, status="processing", progress=10)
+
+        ckpt = ROFORMER_MODELS[model]
+        run_roformer = str(Path(__file__).parent / "run_roformer.py")
+        cmd = [
+            sys.executable, run_roformer,
+            "-m", ckpt,
+            "-o", tmp_out,
+            "--model-dir", str(ROFORMER_MODEL_DIR),
+        ]
+        if _device:
+            cmd.extend(["-d", _device])
+        cmd.append(audio_path)
+
+        # Control CUDA visibility for the child: audio-separator/onnxruntime
+        # auto-select CUDA when it is visible. Force CPU by hiding the GPU so a
+        # cpu-pinned server doesn't accidentally run Roformer on CUDA.
+        env = os.environ.copy()
+        if _device == "cpu":
+            env["CUDA_VISIBLE_DEVICES"] = ""
+
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env,
+        )
+        _update_job(job_id, progress=20)
+        # Roformer on a long track can take a few minutes on GPU and much
+        # longer on CPU; give it a generous ceiling above the demucs path.
+        _, stderr = proc.communicate(timeout=1800)
+
+        if proc.returncode != 0:
+            err_lines = [l for l in stderr.splitlines() if l and '%|' not in l and 'B/s]' not in l]
+            err_msg = '\n'.join(err_lines[-20:]) if err_lines else stderr[-1000:]
+            _update_job(job_id, status="failed", error=err_msg[:1000])
+            return
+
+        # First successful run implies the checkpoint is downloaded/loaded.
+        _mark_lazy_loaded("bs_roformer_sw")
+        _update_job(job_id, progress=80)
+
+        # Map audio-separator's "<base>_(<label>)_<model>.flac" outputs back to
+        # stem names (case-insensitive; labels are bass/drums/guitar/... ).
+        produced = {}
+        for fp in Path(tmp_out).glob("*.flac"):
+            m = re.search(r"_\(([^)]+)\)_", fp.name)
+            if m:
+                produced[m.group(1).strip().lower()] = fp
+
+        cache_path = _cache_entry_path(job_id)
+        cache_path.mkdir(parents=True, exist_ok=True)
+
+        stems_result = {}
+        for stem_name in stem_list:
+            src = produced.get(stem_name.strip().lower())
+            if not src or not src.exists():
+                continue
+            dest = cache_path / f"{stem_name}.flac"
+            shutil.copy2(src, dest)
+            stems_result[stem_name] = f"/download/{job_id}/{stem_name}.flac"
+
+        if stems_result:
+            _remember_cache_entry(job_id)
+        _update_job(job_id, status="complete", progress=100, stems=stems_result)
+
+    except subprocess.TimeoutExpired:
+        if proc:
+            proc.kill()
+        _update_job(job_id, status="failed", error="Separation timed out (30 min limit)")
+    except Exception as e:
+        _update_job(job_id, status="failed", error=str(e))
+    finally:
+        with active_lock:
+            active_count -= 1
+        shutil.rmtree(tmp_out, ignore_errors=True)
+        try:
+            os.unlink(audio_path)
+        except OSError:
+            pass
+
+
 def _update_job(job_id, **kwargs):
     """Update job state and notify WebSocket subscribers."""
     with jobs_lock:
@@ -1722,16 +1864,46 @@ def _warmup_crepe() -> None:
         _set_warmup_state("crepe", f"failed: {exc}")
 
 
+def _warmup_roformer(model: str) -> None:
+    """Pre-download a Roformer checkpoint via run_roformer.py --download-only.
+
+    Only invoked when the *default* model is a Roformer model; otherwise the
+    Roformer checkpoint stays lazy (downloaded on first matching /separate) so
+    it does not bloat the mandatory boot fetch.
+    """
+    _set_warmup_state("bs_roformer_sw", "downloading")
+    run_roformer = str(Path(__file__).parent / "run_roformer.py")
+    cmd = [
+        sys.executable, run_roformer,
+        "-m", ROFORMER_MODELS[model],
+        "-o", tempfile.gettempdir(),
+        "--model-dir", str(ROFORMER_MODEL_DIR),
+        "--download-only",
+    ]
+    proc = subprocess.run(cmd)
+    if proc.returncode == 0:
+        _set_warmup_state("bs_roformer_sw", "ready")
+    else:
+        _set_warmup_state("bs_roformer_sw", f"failed: exit {proc.returncode}")
+
+
 def _run_warmup() -> None:
-    """Run all three warmups sequentially. Called from a daemon thread
+    """Run the core warmups sequentially. Called from a daemon thread
     after the server binds so /health is queryable while downloads
     progress."""
     print("[warmup] starting model weight prefetch — first run can take ~5 min", flush=True)
-    _warmup_demucs()
+    # The active separation model is whichever the server defaults to. If it
+    # is a Roformer model, warm that instead of demucs (and mark demucs
+    # skipped — it is not the active separator for this boot).
+    if _is_roformer_model(_model):
+        _set_warmup_state("demucs", "skipped")
+        _warmup_roformer(_model)
+    else:
+        _warmup_demucs()
     _warmup_whisperx()
     _warmup_crepe()
     with warmup_state_lock:
-        ready = all(s == "ready" for s in warmup_state.values())
+        ready = all(warmup_state[s] == "ready" for s in CORE_WARMUP_MODELS)
     if ready:
         print("[warmup] all models ready", flush=True)
     else:
@@ -1769,6 +1941,7 @@ def main():
         _device = "cuda" if _gpu_available else "cpu"
 
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    ROFORMER_MODEL_DIR.mkdir(parents=True, exist_ok=True)
     _pruned_at_startup = _initialize_cache_order()
 
     print(f"Slopsmith Demucs Server starting on {args.host}:{args.port}")
