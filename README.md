@@ -56,8 +56,8 @@ karaoke pitch chart in the
 ### Install
 
 ```bash
-git clone https://github.com/byrongamatos/slopsmith-demucs-server.git
-cd slopsmith-demucs-server
+git clone https://github.com/got-feedback/feedback-demucs-server.git
+cd feedback-demucs-server
 python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
