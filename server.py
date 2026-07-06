@@ -83,6 +83,78 @@ CACHE_DIR = Path(os.environ.get(
     Path.home() / ".cache" / "slopsmith-demucs",
 ))
 MAX_CONCURRENT = 2
+CACHE_TTL = os.environ.get("CACHE_TTL", "24h")
+# Directories under CACHE_DIR that hold model weights (never auto-deleted)
+_PRESERVED_CACHE_DIRS = frozenset({"torch", "huggingface", "locale"})
+
+
+def _parse_ttl(ttl_str: str) -> int | None:
+    """Parse a TTL string like '1h', '12h', '24h' to seconds.
+    
+    Returns None for 'NEVER' (case-insensitive) to disable cleanup.
+    """
+    ttl_str = ttl_str.strip()
+    if ttl_str.upper() == "NEVER":
+        return None
+    m = re.match(r"^(\d+)\s*([hmd])$", ttl_str)
+    if not m:
+        print(f"[cache] WARNING: Invalid CACHE_TTL={ttl_str!r}, defaulting to 1h")
+        return 3600
+    value = int(m.group(1))
+    unit = m.group(2)
+    multipliers = {"h": 3600, "m": 60, "d": 86400}
+    return value * multipliers[unit]
+
+
+CACHE_TTL_SECONDS = _parse_ttl(CACHE_TTL)
+if CACHE_TTL_SECONDS is not None:
+    print(f"[cache] TTL={CACHE_TTL} ({CACHE_TTL_SECONDS}s)")
+else:
+    print("[cache] Cleanup disabled (CACHE_TTL=NEVER)")
+
+# ── Model idle-unload configuration ──────────────────────────────────────
+# Background thread (_model_idle_loop) unloads WhisperX ASR / aligner and
+# CREPE models that have been idle longer than this timeout, so a mostly-idle
+# server doesn't pin several GB of weights forever. Default 300s (5 min);
+# set MODEL_IDLE_TIMEOUT=NEVER to disable idle unloading.
+MODEL_IDLE_TIMEOUT = os.environ.get("MODEL_IDLE_TIMEOUT", "300")
+
+
+def _parse_model_idle_timeout(val: str) -> int | None:
+    """Parse MODEL_IDLE_TIMEOUT into seconds.
+
+    'NEVER' (case-insensitive) disables idle unloading (returns None).
+    Accepts a plain integer number of seconds (e.g. '300') or a duration
+    with an s/m/h/d suffix (e.g. '90s', '5m', '1h'). Invalid values fall
+    back to the 300s default.
+    """
+    val = val.strip()
+    if val.upper() == "NEVER":
+        return None
+    m = re.match(r"^(\d+)\s*([smhd]?)$", val)
+    if not m:
+        print(f"[model-idle] WARNING: Invalid MODEL_IDLE_TIMEOUT={val!r}, "
+              f"defaulting to 300s")
+        return 300
+    value = int(m.group(1))
+    unit = m.group(2) or "s"
+    multipliers = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+    return value * multipliers[unit]
+
+
+_model_idle_timeout = _parse_model_idle_timeout(MODEL_IDLE_TIMEOUT)
+if _model_idle_timeout is not None:
+    print(f"[model-idle] Idle unload timeout={MODEL_IDLE_TIMEOUT} "
+          f"({_model_idle_timeout}s)")
+else:
+    print("[model-idle] Idle unloading disabled (MODEL_IDLE_TIMEOUT=NEVER)")
+
+# Per-model last-use timestamps ({model_name: epoch_seconds}) and the lock
+# guarding them. Written by _touch_model on every model use and read by the
+# _model_idle_loop daemon thread.
+_model_last_used: dict[str, float] = {}
+_model_idle_lock = threading.Lock()
+
 CACHE_MAX_COMPLETED_JOBS = _parse_cache_max_completed_jobs(
     os.environ.get("SLOPSMITH_DEMUCS_CACHE_MAX_JOBS")
 )
@@ -228,6 +300,12 @@ async def _startup_event():
             _set_warmup_state(k, "skipped")
     else:
         threading.Thread(target=_run_warmup, daemon=True).start()
+    # Start background cache cleanup (daemon thread, dies with server)
+    if CACHE_TTL_SECONDS is not None:
+        threading.Thread(target=_cache_cleanup_loop, daemon=True).start()
+    # Start background model idle unload (daemon thread, dies with server)
+    if _model_idle_timeout is not None:
+        threading.Thread(target=_model_idle_loop, daemon=True, name="model-idle").start()
 
 
 # ── Health ──────────────────────────────────────────────────────────────
@@ -378,7 +456,6 @@ _whisperx_aligners_lock = threading.Lock()
 _whisperx_aligner_locks: dict[str, threading.Lock] = {}
 _whisperx_aligner_locks_guard = threading.Lock()
 
-
 def _get_aligner_load_lock(lang: str) -> threading.Lock:
     """Return the lock that serialises load_align_model calls for one
     language. Created lazily; evicted from ``_whisperx_aligner_locks``
@@ -437,6 +514,7 @@ def _get_whisperx_model():
                     device=_whisperx_device(),
                     compute_type=_whisperx_compute_type(),
                 )
+    _touch_model("whisperx")
     # Intentionally do NOT mark warmup ready here. /align needs both the
     # ASR model AND a wav2vec2 aligner to function — if the aligner load
     # fails (unsupported language, transient network), /align would still
@@ -550,6 +628,7 @@ def _get_whisperx_aligner(language: str):
 
     if lang == "en":
         _mark_lazy_loaded("whisperx")
+    _touch_model("whisperx_aligner")
     return pair
 
 
@@ -584,6 +663,60 @@ def _syllabify(word: str, hyphenator) -> list[str]:
         return list(word)
     parts = hyphenator.inserted(word).split('-')
     return parts if parts else [word]
+
+def _touch_model(name: str) -> None:
+    """Update last-use timestamp for a model."""
+    if _model_idle_timeout is None:
+        return
+    with _model_idle_lock:
+        _model_last_used[name] = time.time()
+
+def _unload_whisperx_model() -> None:
+    """Unload the WhisperX ASR model from memory."""
+    global _whisperx_model
+    if _whisperx_model is not None:
+        _whisperx_model = None
+    if _whisperx_device().startswith("cuda"):
+        try:
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
+    print("[model-idle] Unloaded whisperx ASR model", flush=True)
+
+def _unload_whisperx_aligner(lang: str) -> None:
+    """Unload a specific WhisperX aligner from memory."""
+    with _whisperx_aligners_lock:
+        pair = _whisperx_aligners.pop(lang, None)
+        if pair is not None:
+            with _whisperx_aligner_locks_guard:
+                _whisperx_aligner_locks.pop(lang, None)
+            _set_aligner_state(lang, "evicted")
+    if _whisperx_device().startswith("cuda"):
+        try:
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
+    print(f"[model-idle] Unloaded whisperx aligner: {lang}", flush=True)
+
+def _unload_crepe() -> None:
+    """Unload the CREPE pitch model from memory.
+
+    We never hold a reference to the CREPE network ourselves: torchcrepe
+    lazily loads it the first time ``torchcrepe.predict`` /
+    ``torchcrepe.load.model`` runs and caches it as a module-level global
+    (``torchcrepe.infer.model``). Clearing that global is therefore what
+    actually frees the weights; nulling a local would free nothing.
+    """
+    freed = getattr(torchcrepe.infer, "model", None) is not None
+    torchcrepe.infer.model = None
+    if _crepe_device().startswith("cuda"):
+        try:
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
+    if freed:
+        print("[model-idle] Unloaded CREPE model", flush=True)
+
 
 
 def _split_word_into_syllables(word_seg: dict, hyphenator) -> list[dict]:
@@ -1302,6 +1435,7 @@ def _extract_pitch_with_crepe(audio_path: Path, lyrics: list[dict]) -> list[dict
             nearest = min(indexed_confident, key=lambda c: abs(c[0] - i))
             r["midi"] = nearest[1]
 
+    _touch_model("crepe")
     return [r for r in raw if r["midi"] is not None]
 
 
@@ -1909,6 +2043,90 @@ def _run_warmup() -> None:
     else:
         print("[warmup] finished with failures — see /health for per-model state", flush=True)
 
+
+
+# ── Cache cleanup ────────────────────────────────────────────────────────
+
+def _cache_cleanup_loop() -> None:
+    """Background daemon thread: periodically delete expired stem cache dirs.
+    
+    Walks CACHE_DIR, skips preserved directories (torch, huggingface, locale),
+    and deletes any stem cache directory whose mtime exceeds CACHE_TTL.
+    Runs every 10 minutes.
+    """
+    if CACHE_TTL_SECONDS is None:
+        return  # Shouldn't happen — caller checks, but be safe
+    
+    CHECK_INTERVAL = 600  # 10 minutes between sweep cycles
+    print(f"[cache] Cleanup thread started (check every {CHECK_INTERVAL}s)", flush=True)
+    
+    while True:
+        try:
+            now = time.time()
+            for entry in CACHE_DIR.iterdir():
+                if not entry.is_dir():
+                    continue
+                if entry.name in _PRESERVED_CACHE_DIRS:
+                    continue
+                try:
+                    mtime = entry.stat().st_mtime
+                    age = now - mtime
+                    if age > CACHE_TTL_SECONDS:
+                        print(f"[cache] Deleting expired: {entry.name} "
+                              f"(age={age:.0f}s > TTL={CACHE_TTL_SECONDS}s)", flush=True)
+                        shutil.rmtree(entry, ignore_errors=True)
+                        with jobs_lock:
+                            jobs.pop(entry.name, None)
+                except OSError as e:
+                    print(f"[cache] Error accessing {entry.name}: {e}", flush=True)
+        except Exception as e:
+            print(f"[cache] Cleanup sweep error: {e}", flush=True)
+        time.sleep(CHECK_INTERVAL)
+
+def _model_idle_loop() -> None:
+    """Background daemon thread: unload models idle longer than MODEL_IDLE_TIMEOUT.
+    Checks every 60 seconds. All WhisperX aligners share the one aggregate
+    "whisperx_aligner" idle key, so when it expires every loaded aligner is
+    idle and they are all evicted; the ASR model and CREPE are evicted as
+    whole units. Only runs if MODEL_IDLE_TIMEOUT is set (not NEVER).
+    """
+    if _model_idle_timeout is None:
+        return
+    CHECK_INTERVAL = 60
+    print(
+        f"[model-idle] Thread started (timeout={_model_idle_timeout}s, "
+        f"check every {CHECK_INTERVAL}s)",
+        flush=True,
+    )
+    while True:
+        try:
+            now = time.time()
+            with _model_idle_lock:
+                idle_models = [
+                    name for name, ts in _model_last_used.items()
+                    if (now - ts) > _model_idle_timeout
+                ]
+            for name in idle_models:
+                if name == "whisperx":
+                    _unload_whisperx_model()
+                elif name == "whisperx_aligner":
+                    # Every language is tracked under this single aggregate key,
+                    # so an idle timeout means all loaded aligners are idle —
+                    # evict them all, not just the oldest. Snapshot the languages
+                    # under the lock, then unload each WITHOUT holding it, since
+                    # _unload_whisperx_aligner re-acquires the same
+                    # (non-reentrant) _whisperx_aligners_lock.
+                    with _whisperx_aligners_lock:
+                        idle_langs = list(_whisperx_aligners.keys())
+                    for lang in idle_langs:
+                        _unload_whisperx_aligner(lang)
+                elif name == "crepe":
+                    _unload_crepe()
+                with _model_idle_lock:
+                    _model_last_used.pop(name, None)
+        except Exception as e:
+            print(f"[model-idle] Loop error: {e}", flush=True)
+        time.sleep(CHECK_INTERVAL)
 
 # ── CLI entry point ─────────────────────────────────────────────────────
 

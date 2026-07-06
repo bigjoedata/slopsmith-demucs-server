@@ -1,6 +1,8 @@
 # Slopsmith Demucs Server
 
-A lightweight GPU-accelerated service that provides AI source separation and lyrics alignment for [Slopsmith](https://github.com/got-feedback/feedback). Designed to run on a desktop with a CUDA GPU while Slopsmith runs on a NAS or Docker host.
+A lightweight GPU-accelerated service providing AI source separation, lyrics alignment, and per-syllable pitch extraction for [Slopsmith](https://github.com/byrongamatos/slopsmith). Designed to run on a desktop with a CUDA GPU while Slopsmith runs on a NAS or Docker host.
+
+[![Docker Build](https://github.com/byrongamatos/slopsmith-demucs-server/actions/workflows/docker-build.yml/badge.svg)](https://github.com/byrongamatos/slopsmith-demucs-server/actions/workflows/docker-build.yml)
 
 ## Features
 
@@ -51,17 +53,29 @@ karaoke pitch chart in the
 
 - Python 3.10+
 - CUDA-capable GPU (recommended) or CPU fallback
-- FFmpeg
+- FFmpeg (`apt install ffmpeg` / `brew install ffmpeg`)
 
-### Install
+### Install (Native)
 
 ```bash
 git clone https://github.com/got-feedback/feedback-demucs-server.git
 cd feedback-demucs-server
 python -m venv .venv
 source .venv/bin/activate
+
+# Step 1: Install main dependencies (fastapi, whisperx, torchcrepe, etc.)
+# whisperx pins torch~=2.8.0 + torchaudio~=2.8.0
 pip install -r requirements.txt
+
+# Step 2: Install demucs SEPARATELY (torchaudio version conflict workaround)
+# demucs requires torchaudio<2.1, which conflicts with whisperx.
+# Installing with --no-deps bypasses the bad pin.
+# dora-search is demucs's logging lib (imported as `import dora`).
+pip install demucs --no-deps
+pip install einops julius lameenc openunmix pyyaml tqdm dora-search
 ```
+
+> ⚠️ **Why two install steps?** `demucs` (PyPI 4.0.1) pins `torchaudio<2.1` while `whisperx` needs `torchaudio~=2.8.0`. These are incompatible. Installing demucs with `--no-deps` avoids the conflict. Demucs works fine with modern torchaudio — only the `save_audio` function had issues, and that's patched in `run_demucs.py` to use `soundfile` instead.
 
 ### Run
 
@@ -70,29 +84,25 @@ python server.py --port 7865
 ```
 
 Options:
-- `--port` — port to listen on (default: 7865)
-- `--host` — host to bind to (default: 0.0.0.0)
-- `--model` — Demucs model (default: htdemucs_ft)
-- `--device` — force cpu or cuda (auto-detected by default)
-- `--api-key` — optional API key for authentication
-- `--skip-warmup` — skip the startup model-weight prefetch (see below)
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--port` | 7865 | Port to listen on |
+| `--host` | 0.0.0.0 | Host to bind to |
+| `--model` | htdemucs_ft | Demucs model (htdemucs_ft, htdemucs_6s, mdx_extra) |
+| `--device` | auto | Force cpu or cuda |
+| `--api-key` | — | API key for authentication |
+| `--skip-warmup` | — | Skip startup model-weight prefetch |
+
+Environment variables override CLI defaults: `SLOPSMITH_DEMUCS_MODEL`, `SLOPSMITH_DEMUCS_DEVICE`, `SLOPSMITH_API_KEY`.
 
 ### First-start model weight download
 
-On first start the server pre-downloads the model weights for all
-three endpoints so the first user-facing request doesn't stall on a
-CDN fetch. Total download is **~1.5 GB** (htdemucs_ft, Whisper medium,
-CREPE full, English wav2vec2 aligner). Aligners for other languages
-download on the first `/align` call that uses that language.
+On first start the server pre-downloads model weights (~1.5 GB for all three endpoints: htdemucs_ft, Whisper medium, CREPE full, English wav2vec2). Subsequent restarts use cached weights.
 
-The download runs in a background thread started from the FastAPI
-startup hook, so it fires only after the server has bound the port —
-meaning `/health` is queryable from the very first moment.  Each
-library prints its own `tqdm` progress bar to stderr — the operator
-sees real byte-level progress in the terminal or in
-`journalctl -u slopsmith-demucs --follow`.
+The download runs in a background thread, so `/health` is queryable immediately. Each library prints its own `tqdm` progress bar.
 
-`/health` reports per-model status under `warmup`:
+`/health` reports per-model status:
 
 ```json
 {
@@ -101,45 +111,194 @@ sees real byte-level progress in the terminal or in
     "demucs": "ready",
     "whisperx": "downloading",
     "crepe": "pending",
-    "whisperx_aligners": {
-      "en": "ready",
-      "es": "downloading"
-    }
+    "whisperx_aligners": { "en": "ready" }
   }
 }
 ```
 
-Values:
-- `pending` → `downloading` → `ready` — normal warmup progression.
-- `failed: <reason>` — download or model-load error; endpoint still works, just lazy-downloads on first request.
-- `skipped` — `--skip-warmup` was passed; per-endpoint calls lazy-download on demand.
-- `evicted` — an LRU aligner was evicted to free memory (appears in `whisperx_aligners`; also appears at the top-level `whisperx` field if the English aligner is evicted, since that breaks the warmup contract).
+States: `pending` → `downloading` → `ready` | `failed: <reason>` | `skipped` | `evicted`.
 
-Subsequent restarts use the cached weights and reach `ready` within
-a couple of seconds. Pass `--skip-warmup` if you need to start the
-server in an environment without internet access; per-endpoint calls
-will lazy-download on demand instead.
-
-The top-level `whisperx` field reflects the warmup contract — ASR
-model + English wav2vec2 aligner. Other languages aren't pre-warmed
-(we don't know which ones a client will use) and download on the
-first `/align` request in that language. The `whisperx_aligners` map
-exposes per-language aligner state so multilingual clients can poll
-for their language's readiness before issuing a real `/align` call.
+Pass `--skip-warmup` for environments without internet access.
 
 ### Run as a systemd service
 
+1. Copy and edit the service file:
 ```bash
 cp slopsmith-demucs.service ~/.config/systemd/user/
+# Edit ~/.config/systemd/user/slopsmith-demucs.service
+# Set User, ExecStart paths to match your setup
+nano ~/.config/systemd/user/slopsmith-demucs.service
+```
+
+2. Enable and start:
+```bash
+systemctl --user daemon-reload
 systemctl --user enable slopsmith-demucs
 systemctl --user start slopsmith-demucs
 ```
 
-Edit the service file to adjust the path to your clone and desired model.
+3. Monitor:
+```bash
+journalctl --user -u slopsmith-demucs --follow
+```
 
-### Configure in Slopsmith
+## Docker
 
-In Slopsmith settings, set the Demucs Server URL to `http://<your-desktop-ip>:7865`.
+### Build
+
+```bash
+docker build -t slopsmith-demucs-server .
+```
+
+### Run (CPU)
+
+```bash
+docker run -p 7865:7865 slopsmith-demucs-server
+```
+
+### Run (GPU)
+
+Requires [nvidia-container-toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html):
+
+```bash
+docker run --gpus all -p 7865:7865 slopsmith-demucs-server
+```
+
+### Docker Compose
+
+```bash
+# Pull from GHCR and run (CPU)
+docker compose up -d
+
+# GPU mode: uncomment runtime: nvidia + NVIDIA_* env vars in compose file
+docker compose up -d
+```
+
+### Persistent model cache
+
+Model weights are stored in `/app/cache` inside the container. The compose file maps this to a persistent volume so weights survive restarts:
+
+```bash
+docker compose down    # cache preserved
+docker compose down -v # cache deleted (if using named volume)
+```
+
+To use a custom host path instead of a named volume (e.g. for Portainer or to save space on a specific drive), replace the volume in `docker-compose.yml`:
+
+```yaml
+volumes:
+  - /home/AI/slopsmith-demucs-cache:/app/cache
+```
+
+Then copy the existing cache to the new location:
+```bash
+# Find old volume path
+docker volume inspect slopsmith-demucs-server_demucs-cache
+# Copy to new location
+sudo cp -a /var/lib/docker/volumes/slopsmith-demucs-server_demucs-cache/_data/. /home/AI/slopsmith-demucs-cache/
+```
+
+**Cache environment variables** (all redirect to `/app/cache` to prevent container root disk exhaustion):
+
+| Variable | Purpose |
+|----------|---------|
+| `SLOPSMITH_DEMUCS_CACHE` | Server cache root |
+| `HF_HOME` | HuggingFace model cache |
+| `TORCH_HOME` | PyTorch hub cache |
+| `HUGGINGFACE_HUB_CACHE` | HuggingFace hub downloads |
+
+### Auto-update
+
+The container can automatically check for repository updates and restart. **Disabled by default** (safe for Portainer/deployments without `.git` access).
+
+**To enable:**
+1. Uncomment the `.git` bind mount in `docker-compose.yml`
+2. Set `AUTO_UPDATE=true` in environment
+3. Redeploy
+
+**How it works:**
+1. A background daemon runs inside the container
+2. Every `UPDATE_CHECK_INTERVAL` seconds (default: 3600 = 1 hour), it checks if the current time matches `UPDATE_TIME` (default: 04:00)
+3. At the configured time, it runs `git fetch origin` and compares `HEAD` with `@{upstream}`
+4. If changes are detected, it pulls the new code, reinstalls dependencies, and gracefully restarts the server
+
+**Configuration via environment variables:**
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `AUTO_UPDATE` | `false` | Enable/disable auto-update |
+| `UPDATE_TIME` | `04:00` | Time of day to check (HH:MM, 24h) |
+| `UPDATE_CHECK_INTERVAL` | `3600` | Seconds between time checks (3600 = 1 hour) |
+| `SKIP_WARMUP` | `false` | Skip model weight download on startup |
+| `SLOPSMITH_DEMUCS_MODEL` | — | Override default Demucs model |
+| `SLOPSMITH_API_KEY` | — | API authentication key |
+| `CACHE_TTL` | `24h` | Cache cleanup TTL (`1h`, `12h`, `24h`, or `NEVER` to disable auto-cleanup) |
+
+**Disable auto-update** (default — safe for Portainer):
+```bash
+docker run -e AUTO_UPDATE=false -p 7865:7865 slopsmith-demucs-server
+```
+
+### Cache cleanup
+
+The server automatically deletes old stem cache directories to prevent disk growth. A background thread runs every 10 minutes, checks each stem cache directory under `SLOPSMITH_DEMUCS_CACHE`, and removes directories older than `CACHE_TTL`.
+
+Model weight caches (`torch/`, `huggingface/`, `locale/`) are **never** deleted — only the stem output cache is cleaned.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `CACHE_TTL` | `24h` | Maximum age of cache entries (`1h`, `12h`, `24h`, or `NEVER` to disable) |
+
+**Disable auto-cleanup:**
+```bash
+docker run -e CACHE_TTL=NEVER -p 7865:7865 slopsmith-demucs-server
+```
+
+**Set custom TTL (e.g. 12 hours):**
+```bash
+docker run -e CACHE_TTL=12h -p 7865:7865 slopsmith-demucs-server
+```
+
+### GitHub Container Registry (CI)
+
+The CI workflow (`.github/workflows/docker-build.yml`) automatically builds the Docker image, pushes it to GHCR, generates an SBOM, and runs a grype vulnerability scan on every push to `main`.
+
+**To enable on your fork:**
+1. Go to your fork on GitHub → **Actions** tab
+2. Click **"I understand my workflows, go ahead and enable them"**
+3. Push to `main` — the CI builds and scans automatically
+
+**Pull the latest image:**
+```bash
+docker pull ghcr.io/YOUR_GITHUB_USER/slopsmith-demucs-server:latest
+```
+
+**Or from the upstream repo (once PR is merged):**
+```bash
+docker pull ghcr.io/byrongamatos/slopsmith-demucs-server:latest
+```
+
+**Build directly from git (no clone needed):**
+```bash
+# From upstream main
+docker build -t slopsmith-demucs-server https://github.com/byrongamatos/slopsmith-demucs-server.git#main
+
+# From your fork
+docker build -t slopsmith-demucs-server https://github.com/YOUR_USER/slopsmith-demucs-server.git#main
+
+# Run it
+docker run --gpus all -p 7865:7865 slopsmith-demucs-server
+```
+
+**Run via Docker Compose with git build:**
+```yaml
+services:
+  slopsmith-demucs:
+    build: https://github.com/byrongamatos/slopsmith-demucs-server.git#main
+    ports:
+      - "7865:7865"
+```
+
 
 ## API
 
@@ -186,8 +345,7 @@ Per-syllable pitch extraction using CREPE.
 | `file` | Form (file) | Vocals stem (any format librosa can read) |
 | `lyrics` | Form | JSON array of `{"t": float, "d": float}` — token start / duration in seconds |
 
-Returns: `{"notes": [{"t": 12.34, "d": 0.5, "midi": 64}, ...]}`. Tokens for which no
-pitch could be estimated (even after neighbour-borrow) are omitted.
+Returns: `{"notes": [{"t": 12.34, "d": 0.5, "midi": 64}, ...]}`. Tokens for which no pitch could be estimated (even after neighbour-borrow) are omitted.
 
 ### `GET /download/{job_id}/{stem}`
 
@@ -200,3 +358,7 @@ List or inspect separation jobs.
 ### `WS /ws/jobs/{job_id}`
 
 WebSocket for real-time separation progress updates.
+
+### Configure in Slopsmith
+
+Set the Demucs Server URL to `http://<your-server-ip>:7865` in Slopsmith settings.
