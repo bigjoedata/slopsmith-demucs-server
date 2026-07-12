@@ -99,7 +99,20 @@ RUN out="$(pip install --no-cache-dir --no-deps --only-binary=:all: 'diffq-fixed
 COPY . .
 
 # ---- Least privilege runtime user ----
+#
+# /app/cache MUST exist in the image, owned by appuser, BEFORE the VOLUME below.
+#
+# Docker initializes a fresh named volume from whatever sits at that mountpoint in the
+# image — ownership included. With nothing there, it creates the directory as root:root.
+# The container runs as appuser (uid 10001), so the server dies on its first write:
+#
+#     PermissionError: [Errno 13] Permission denied: '/app/cache/_roformer-models'
+#
+# ...and `restart: unless-stopped` turns that into a crash-loop. Not theoretical: it is
+# what the freshly published image did on its very first run, and it breaks the documented
+# `docker compose up -d` path exactly as hard as anything else.
 RUN useradd --create-home --uid 10001 appuser \
+    && mkdir -p /app/cache \
     && chown -R appuser:appuser /app
 
 
