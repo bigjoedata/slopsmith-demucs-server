@@ -67,15 +67,35 @@ source .venv/bin/activate
 # whisperx pins torch~=2.8.0 + torchaudio~=2.8.0
 pip install -r requirements.txt
 
-# Step 2: Install demucs SEPARATELY (torchaudio version conflict workaround)
+# Step 2: Install audio-separator SEPARATELY (diffq source-build workaround)
+# Its deps pull in `diffq`, which has no wheel for Python 3.11+ and would try to
+# compile from source. Its real deps are already in requirements.txt.
+pip install "audio-separator>=0.44.0" --no-deps
+
+# Step 3: Install demucs SEPARATELY (torchaudio version conflict workaround)
 # demucs requires torchaudio<2.1, which conflicts with whisperx.
 # Installing with --no-deps bypasses the bad pin.
 # dora-search is demucs's logging lib (imported as `import dora`).
 pip install demucs --no-deps
-pip install einops julius lameenc openunmix pyyaml tqdm dora-search
+pip install einops julius lameenc openunmix pyyaml tqdm dora-search sphn
+
+# Step 4 (optional): diffq, for QUANTIZED demucs checkpoints only.
+# --only-binary=:all: makes pip fail rather than fall back to the sdist, so this can
+# never start a compile.
+#
+# No `|| true` here on purpose: that would hide a network/index/permissions failure too,
+# and you would think diffq was installed when it isn't. Let it fail loudly, and skip it
+# ONLY if pip says "No matching distribution found" / "Could not find a version that
+# satisfies" — that means no wheel exists for your Python (macOS on 3.11+, Linux on 3.13),
+# which is safe: the bs_roformer_sw model feedBack splits with does not use diffq.
+pip install "diffq-fixed>=0.2" --no-deps --only-binary=:all:
 ```
 
-> ⚠️ **Why two install steps?** `demucs` (PyPI 4.0.1) pins `torchaudio<2.1` while `whisperx` needs `torchaudio~=2.8.0`. These are incompatible. Installing demucs with `--no-deps` avoids the conflict. Demucs works fine with modern torchaudio — only the `save_audio` function had issues, and that's patched in `run_demucs.py` to use `soundfile` instead.
+> ⚠️ **Why the separate install steps?**
+>
+> **`demucs`** (PyPI 4.0.1) pins `torchaudio<2.1` while `whisperx` needs `torchaudio~=2.8.0`. These are incompatible. Installing demucs with `--no-deps` avoids the conflict. Demucs works fine with modern torchaudio — only the `save_audio` function had issues, and that's patched in `run_demucs.py` to use `soundfile` instead.
+>
+> **`audio-separator`** declares `diffq (>=0.2); sys_platform != "win32"`. `diffq` is a C-extension whose newest wheels stop at **cp310** — so on any Python 3.11+ pip falls back to its sdist and needs a C compiler. That is why this is not in `requirements.txt`: `pip install -r` resolves that file first, so the compile would fail before the `--no-deps` step could run. (Windows escapes this by accident: it resolves to `diffq-fixed`, which does ship modern wheels.) `audio-separator`'s real runtime deps are listed in `requirements.txt` instead, and it is installed on top with `--no-deps`.
 
 ### Run
 
