@@ -200,7 +200,7 @@ docker compose up -d
 > Early images created their model-cache volume **owned by root**, while the server runs as
 > an unprivileged user (uid 10001). The container would start and then immediately die with
 >
-> ```
+> ```text
 > PermissionError: [Errno 13] Permission denied: '/app/cache/_roformer-models'
 > ```
 >
