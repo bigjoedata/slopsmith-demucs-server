@@ -70,6 +70,75 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+      # ── Does the image actually RUN? ────────────────────────────────────────
+      #
+      # A green build says the layers assembled. It says nothing about whether the thing
+      # starts. We published an image that built perfectly and then crash-looped on its
+      # first run, because a fresh named volume is created root-owned while the container
+      # runs as uid 10001:
+      #
+      #     PermissionError: [Errno 13] Permission denied: '/app/cache/_roformer-models'
+      #
+      # That is exactly what `docker compose up -d` does, and no amount of building would
+      # have caught it. So: start the container the way a user does, and require /health
+      # to answer.
+      #
+      # The FRESH NAMED VOLUME is the load-bearing part of this test. Without it the
+      # container writes to the image's own filesystem, the permission bug never fires,
+      # and this test would happily pass on the very bug it exists to catch.
+      #
+      # SKIP_WARMUP=true: /health binds immediately and answers while the models load;
+      # warming up would pull ~1.5 GB of weights we don't need in order to answer
+      # "did the process survive its first write?".
+      - name: Smoke test — the container must start and serve /health
+        run: |
+          set -euo pipefail
+          docker volume rm -f smoke-cache >/dev/null 2>&1 || true
+          docker run -d --name smoke \
+            -e SKIP_WARMUP=true \
+            -v smoke-cache:/app/cache \
+            -p 7865:7865 \
+            "${{ steps.tag.outputs.scan }}"
+
+          ok=""
+          for i in $(seq 1 60); do
+            if curl -fsS --max-time 3 http://127.0.0.1:7865/health >/dev/null 2>&1; then
+              ok=1; break
+            fi
+            # Fail fast rather than burning two minutes on a container that is already dead
+            # (or, worse, on one that `restart: unless-stopped` is bouncing in a loop).
+            state="$(docker inspect -f '{{.State.Status}}' smoke 2>/dev/null || echo gone)"
+            if [ "$state" != "running" ]; then
+              echo "::error::container is '$state' - it did not stay up"
+              break
+            fi
+            sleep 2
+          done
+
+          echo "--- container logs ---"
+          docker logs --tail 60 smoke 2>&1 || true
+          echo "----------------------"
+
+          if [ -z "$ok" ]; then
+            echo "::error::/health never answered. The image builds but does not run."
+            docker rm -f smoke >/dev/null 2>&1 || true
+            docker volume rm -f smoke-cache >/dev/null 2>&1 || true
+            exit 1
+          fi
+
+          echo "/health responded:"
+          curl -fsS --max-time 5 http://127.0.0.1:7865/health
+
+          # Prove the cache is actually WRITABLE as the unprivileged runtime user - the
+          # precise thing that was broken. /health answering is necessary but not
+          # sufficient: the server only touches the cache once a job arrives.
+          docker exec smoke sh -c 'touch /app/cache/.write-probe && rm /app/cache/.write-probe' \
+            || { echo "::error::/app/cache is not writable by the runtime user"; exit 1; }
+          echo "cache dir is writable by the runtime user"
+
+          docker rm -f smoke >/dev/null 2>&1 || true
+          docker volume rm -f smoke-cache >/dev/null 2>&1 || true
+
       - name: Create output directory
         run: mkdir -p sbom/
 

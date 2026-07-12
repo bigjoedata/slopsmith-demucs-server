@@ -190,9 +190,33 @@ docker run --gpus all -p 7865:7865 slopsmith-demucs-server
 # Pull from GHCR and run (CPU)
 docker compose up -d
 
-# GPU mode: uncomment runtime: nvidia + NVIDIA_* env vars in compose file
+# GPU mode: uncomment `gpus: all` in the compose file (needs nvidia-container-toolkit;
+# Linux or Windows/WSL2 only — macOS cannot pass a GPU through at all)
 docker compose up -d
 ```
+
+> #### ⚠️ Ran an image from before 2026-07-12? Delete the cache volume.
+>
+> Early images created their model-cache volume **owned by root**, while the server runs as
+> an unprivileged user (uid 10001). The container would start and then immediately die with
+>
+> ```
+> PermissionError: [Errno 13] Permission denied: '/app/cache/_roformer-models'
+> ```
+>
+> ...which `restart: unless-stopped` turns into a crash-loop.
+>
+> The image is fixed — but **pulling the new image is not enough on its own**. Docker sets a
+> volume's ownership only when it *first creates* it, so a volume made by an older image stays
+> root-owned forever and will keep crash-looping on a perfectly good image. Remove it:
+>
+> ```bash
+> docker compose down
+> docker volume rm feedback-demucs-cache   # or: slopsmith-demucs-server_demucs-cache
+> docker compose up -d
+> ```
+>
+> The volume only holds cached model weights — deleting it costs you a re-download, nothing else.
 
 ### Persistent model cache
 
