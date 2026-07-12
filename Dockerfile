@@ -78,10 +78,21 @@ RUN pip install --no-cache-dir \
 # to the sdist, so a missing wheel can never reintroduce a source build here. On this
 # base (glibc >= 2.28, cp311) `diffq-fixed` has a manylinux_2_28 wheel; it installs
 # under the module name `diffq`, so it satisfies the import just like the original.
-# `|| true`: if that ever stops being true, the image still builds, minus quantized
-# demucs models.
-RUN pip install --no-cache-dir --no-deps --only-binary=:all: "diffq-fixed>=0.2" \
-    || echo "WARNING: no diffq wheel for this interpreter - quantized demucs checkpoints will not load (bs_roformer_sw is unaffected)"
+#
+# The tolerated failure is gated on the SPECIFIC "no wheel exists" signature. A bare
+# `|| true` would also swallow a transient network/index error and quietly ship an image
+# without diffq while CI stayed green — a silent downgrade is worse than a failed build.
+RUN out="$(pip install --no-cache-dir --no-deps --only-binary=:all: 'diffq-fixed>=0.2' 2>&1)"; rc=$?; \
+    echo "$out"; \
+    if [ "$rc" -ne 0 ]; then \
+        case "$out" in \
+            *"No matching distribution found"*|*"Could not find a version that satisfies"*) \
+                echo "WARNING: no diffq wheel for this interpreter - quantized demucs checkpoints will not load (bs_roformer_sw is unaffected)" ;; \
+            *) \
+                echo "ERROR: diffq install failed for a reason OTHER than a missing wheel (network? index?). Failing the build rather than silently shipping without it." >&2; \
+                exit "$rc" ;; \
+        esac; \
+    fi
 
 # ---- COPY application code ----
 COPY . .
