@@ -379,7 +379,11 @@ async def separate_upload(
     # Queue the job
     result = _enqueue_job(job_id, tmp.name, stem_list, use_model)
     if result.get("error"):
-        return JSONResponse(result, 503)
+        # 503 means "no capacity, back off and retry" — and clients (including feedBack's
+        # own splitter) treat it exactly that way. A stem-set CONFLICT is not a capacity
+        # problem, and returning one as 503 makes a client back off against a condition
+        # backing off cannot fix, with no way to tell the two apart. Let the decision choose.
+        return JSONResponse(result, result.pop("status_code", 503))
     return result
 
 
@@ -418,7 +422,11 @@ async def separate_url(
 
     result = _enqueue_job(job_id, tmp.name, stem_list, use_model)
     if result.get("error"):
-        return JSONResponse(result, 503)
+        # 503 means "no capacity, back off and retry" — and clients (including feedBack's
+        # own splitter) treat it exactly that way. A stem-set CONFLICT is not a capacity
+        # problem, and returning one as 503 makes a client back off against a condition
+        # backing off cannot fix, with no way to tell the two apart. Let the decision choose.
+        return JSONResponse(result, result.pop("status_code", 503))
     return result
 
 
@@ -1613,10 +1621,23 @@ def _check_cache(job_id, stem_list, model):
 
     stems_found = {}
     for stem_name in stem_list:
-        for ext in (".mp3", ".wav", ".flac"):
-            p = cache_path / f"{stem_name}{ext}"
-            if p.exists():
-                stems_found[stem_name] = f"/download/{job_id}/{stem_name}{ext}"
+        # Probe the LOWERCASE filename first (what the workers now write), then the caller's
+        # own casing (what pre-fix cache entries were written with). Probing only the
+        # caller's spelling would miss a cache entry that exists — a mixed-case `stems=`
+        # request would silently re-separate, and after a restart the in-memory jobs table
+        # is empty, so this is the ONLY path that can find it.
+        lower = stem_name.strip().lower()
+        for candidate in (lower, stem_name):
+            hit = None
+            for ext in (".mp3", ".wav", ".flac"):
+                p = cache_path / f"{candidate}{ext}"
+                if p.exists():
+                    # The key echoes what the caller asked for; the URL points at the file
+                    # that actually exists on disk.
+                    hit = f"/download/{job_id}/{candidate}{ext}"
+                    break
+            if hit:
+                stems_found[stem_name] = hit
                 break
 
     if len(stems_found) == len(stem_list):
@@ -1684,43 +1705,144 @@ def _initialize_cache_order():
 
 
 def _enqueue_job(job_id, audio_path, stem_list, model):
-    """Create a job and start processing in background."""
+    """Create a job and start processing in background.
+
+    job_id is (audio_hash, model) and deliberately does NOT include the stem set, so this
+    has to decide whether an existing job for the same audio+model actually answers THIS
+    request. Getting that wrong in either direction is expensive:
+
+      * too permissive -> return a job that lacks the caller's stems (silent data loss);
+      * too strict     -> re-run a ~2 min GPU separation that cannot produce a different
+                          answer (an unbounded recompute loop for a stem the model does not
+                          have).
+
+    Everything up to and including installing the replacement job happens under jobs_lock,
+    so two concurrent superset requests cannot both decide to re-separate and start
+    duplicate work.
+    """
     global active_count
 
+    wanted = {s.strip().lower() for s in stem_list}
+
     with jobs_lock:
-        # If job already exists and is processing/complete, return it
         existing = jobs.get(job_id)
-        if existing and existing["status"] in ("processing", "complete"):
-            if existing["status"] == "complete":
-                return {"job_id": job_id, "stems": existing["stems"], "cached": True}
-            return {"job_id": job_id, "status": "processing"}
 
-    with active_lock:
-        if active_count >= MAX_CONCURRENT:
-            return {"error": "Server busy — max concurrent separations reached", "job_id": job_id}
+        if existing and existing.get("status") == "complete":
+            # Normalize keys before BOTH the coverage test and the lookup. A job from before
+            # this fix stores `stems` keyed by the caller's original casing, so checking
+            # case-insensitively and then looking up by the lowercased name would pass the
+            # check and match nothing - `cached: true` with an empty stems dict.
+            all_urls = {k.strip().lower(): v
+                        for k, v in (existing.get("stems_all")
+                                     or existing.get("stems") or {}).items()}
+            have = set(all_urls)
+            # Stems this MODEL could not produce (htdemucs has no `guitar`). Re-running will
+            # not conjure them: neither runner passes stem_list to the subprocess, so the
+            # separation is byte-for-byte the same work with the same outputs.
+            known_missing = {s.strip().lower() for s in (existing.get("missing") or [])}
 
-    job = {
-        "job_id": job_id,
-        "status": "processing",
-        "progress": 0,
-        "stems": {},
-        "error": None,
-        "model": model,
-        "created_at": time.time(),
-    }
-    with jobs_lock:
-        jobs[job_id] = job
-        # Trim old jobs
+            if wanted <= have:
+                return {
+                    "job_id": job_id,
+                    # Keys echo the caller's spelling; values come from the normalized map.
+                    "stems": {s: all_urls[s.strip().lower()] for s in stem_list},
+                    "cached": True,
+                }
+
+            if wanted <= (have | known_missing):
+                # Everything we lack is known-impossible for this model. Serve what exists
+                # and SAY what doesn't, rather than re-separating on every request forever.
+                return {
+                    "job_id": job_id,
+                    "stems": {s: all_urls[s.strip().lower()]
+                              for s in stem_list if s.strip().lower() in all_urls},
+                    "missing": [s for s in stem_list
+                                if s.strip().lower() in known_missing],
+                    "cached": True,
+                }
+
+            # Genuinely incomplete: an older, narrower run, or a pre-fix job that recorded no
+            # `missing`. Fall through and re-separate so the caller gets what it asked for.
+
+        elif existing and existing.get("status") == "processing":
+            in_flight_raw = existing.get("stem_list")
+            if in_flight_raw is None:
+                # A job started by an older server version: we cannot know what it will
+                # produce. Attaching would risk completing without the caller's stems - the
+                # exact silent loss this change exists to stop - so refuse rather than guess.
+                return {
+                    "error": "A separation for this audio is already running, but its stem "
+                             "set is unknown (it was started by an earlier server version). "
+                             "Retry once it finishes.",
+                    "job_id": job_id,
+                    "status_code": 409,     # Conflict, NOT 503: capacity is fine.
+                }
+            in_flight = {s.strip().lower() for s in in_flight_raw}
+            if wanted <= in_flight:
+                return {"job_id": job_id, "status": "processing"}
+            return {
+                "error": "A separation for this audio is already running with a smaller stem "
+                         "set. Retry once it finishes and the extra stems will be computed.",
+                "job_id": job_id,
+                "status_code": 409,         # Conflict, NOT 503: capacity is fine.
+            }
+
+        # ── Nothing usable exists: take the job. ─────────────────────────────────────────
+        # Still under jobs_lock. The capacity check and the `processing` entry must be
+        # installed here, not after releasing it: two concurrent superset requests would
+        # otherwise both find the stale completed job, both fall through, and both start a
+        # separation for the same job_id - duplicating several GPU-minutes and racing to
+        # overwrite each other's result.
+        with active_lock:
+            # RESERVE, don't just look. Checking without incrementing let two near-
+            # simultaneous enqueues (for different job_ids) both pass the gate before either
+            # worker got as far as incrementing — briefly running MAX_CONCURRENT+1
+            # separations and over-subscribing the GPU, which on a small card means an OOM
+            # kill mid-job rather than a queue.
+            #
+            # The runners no longer increment; they only decrement in their `finally`. The
+            # slot is held from here until the worker finishes, so the count can never lag
+            # behind reality.
+            if active_count >= MAX_CONCURRENT:
+                return {"error": "Server busy — max concurrent separations reached",
+                        "job_id": job_id}
+            active_count += 1
+
+        jobs[job_id] = {
+            "job_id": job_id,
+            "status": "processing",
+            "progress": 0,
+            "stems": {},
+            # What THIS run was asked for, and (once complete) everything the model actually
+            # produced plus anything it could not. A later request for a different stem set
+            # needs all three to decide whether this job answers it.
+            "stem_list": list(stem_list),
+            "stems_all": {},
+            "missing": [],
+            "error": None,
+            "model": model,
+            "created_at": time.time(),
+        }
         while len(jobs) > 200:
             jobs.popitem(last=False)
 
+    # Outside the lock: starting a thread can block, and the job is already visible as
+    # `processing`, so any concurrent caller now attaches instead of duplicating it.
     runner = _run_roformer if _is_roformer_model(model) else _run_demucs
-    thread = threading.Thread(
-        target=runner,
-        args=(job_id, audio_path, stem_list, model),
-        daemon=True,
-    )
-    thread.start()
+    try:
+        threading.Thread(
+            target=runner,
+            args=(job_id, audio_path, stem_list, model),
+            daemon=True,
+        ).start()
+    except Exception as e:
+        # The slot is RESERVED, and the runner's `finally` — the only thing that releases it
+        # — will now never run. Release it here, or a failed thread start leaks a slot
+        # permanently and the server wedges one separation earlier, for good.
+        with active_lock:
+            active_count -= 1
+        _update_job(job_id, status="failed", error=f"could not start the worker: {e}")
+        return {"error": f"Could not start the separation: {e}", "job_id": job_id}
 
     return {"job_id": job_id, "status": "processing"}
 
@@ -1729,8 +1851,9 @@ def _run_demucs(job_id, audio_path, stem_list, model):
     """Run demucs separation in a background thread."""
     global active_count
 
-    with active_lock:
-        active_count += 1
+    # NB: the slot was RESERVED by _enqueue_job before this thread was started (see the note
+    # there). Incrementing here as well would double-count and let the server run under its
+    # own limit. We only release it, in the `finally` below.
 
     tmp_out = tempfile.mkdtemp(prefix="demucs_out_")
     try:
@@ -1785,19 +1908,25 @@ def _run_demucs(job_id, audio_path, stem_list, model):
         cache_path = _cache_entry_path(job_id)
         cache_path.mkdir(parents=True, exist_ok=True)
 
-        stems_result = {}
-        for stem_name in stem_list:
-            src = out_track_dir / f"{stem_name}.wav"
-            if not src.exists():
-                continue
-
-            wav_dest = cache_path / f"{stem_name}.wav"
+        # Cache EVERY stem the model produced, not just this caller's subset — see the note
+        # in _run_roformer. demucs writes its full stem set to out_track_dir whether we take
+        # them or not; dropping the extras means the next request for a superset re-runs a
+        # separation we already did.
+        stems_all = {}
+        for src in sorted(out_track_dir.glob("*.wav")):
+            label = src.stem.strip().lower()
+            wav_dest = cache_path / f"{label}.wav"
             shutil.copy2(src, wav_dest)
-            stems_result[stem_name] = f"/download/{job_id}/{stem_name}.wav"
+            stems_all[label] = f"/download/{job_id}/{label}.wav"
 
-        if stems_result:
+        stems_result = {s: stems_all[s.strip().lower()]
+                        for s in stem_list if s.strip().lower() in stems_all}
+
+        if stems_all:
             _remember_cache_entry(job_id)
-        _update_job(job_id, status="complete", progress=100, stems=stems_result)
+        missing = [s for s in stem_list if s.strip().lower() not in stems_all]
+        _update_job(job_id, status="complete", progress=100, stems=stems_result,
+                    stems_all=stems_all, missing=missing)
 
     except subprocess.TimeoutExpired:
         proc.kill()
@@ -1826,8 +1955,9 @@ def _run_roformer(job_id, audio_path, stem_list, model):
     """
     global active_count
 
-    with active_lock:
-        active_count += 1
+    # NB: the slot was RESERVED by _enqueue_job before this thread was started (see the note
+    # there). Incrementing here as well would double-count and let the server run under its
+    # own limit. We only release it, in the `finally` below.
 
     tmp_out = tempfile.mkdtemp(prefix="roformer_out_")
     proc = None
@@ -1882,18 +2012,32 @@ def _run_roformer(job_id, audio_path, stem_list, model):
         cache_path = _cache_entry_path(job_id)
         cache_path.mkdir(parents=True, exist_ok=True)
 
-        stems_result = {}
-        for stem_name in stem_list:
-            src = produced.get(stem_name.strip().lower())
-            if not src or not src.exists():
+        # Cache EVERY stem the model produced, not just the ones this caller asked for.
+        #
+        # The separation computes them all regardless — bs_roformer_sw always emits six —
+        # so discarding the unrequested ones means the next request for a larger stem set
+        # pays the full inference again (~2 min on a GPU) for stems we had already made and
+        # deleted. Caching all of them turns that into a cache hit, and it is what lets the
+        # cache honour a request for a SUPERSET of what was originally asked for.
+        stems_all = {}
+        for label, src in produced.items():
+            if not src.exists():
                 continue
-            dest = cache_path / f"{stem_name}.flac"
+            dest = cache_path / f"{label}.flac"
             shutil.copy2(src, dest)
-            stems_result[stem_name] = f"/download/{job_id}/{stem_name}.flac"
+            stems_all[label] = f"/download/{job_id}/{label}.flac"
 
-        if stems_result:
+        # ...but return only what this caller asked for.
+        stems_result = {s: stems_all[s.strip().lower()]
+                        for s in stem_list if s.strip().lower() in stems_all}
+
+        if stems_all:
             _remember_cache_entry(job_id)
-        _update_job(job_id, status="complete", progress=100, stems=stems_result)
+        # `missing` is explicit: a caller that asked for `guitar` from a 4-stem model should
+        # be told it isn't coming, not silently handed a short dict and left to wonder.
+        missing = [s for s in stem_list if s.strip().lower() not in stems_all]
+        _update_job(job_id, status="complete", progress=100, stems=stems_result,
+                    stems_all=stems_all, missing=missing)
 
     except subprocess.TimeoutExpired:
         if proc:
