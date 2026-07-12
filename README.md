@@ -80,10 +80,15 @@ pip install demucs --no-deps
 pip install einops julius lameenc openunmix pyyaml tqdm dora-search sphn
 
 # Step 4 (optional): diffq, for QUANTIZED demucs checkpoints only.
-# --only-binary=:all: makes pip fail rather than fall back to the sdist, so this
-# can never start a compile. If no wheel exists for your Python, skip it — the
-# bs_roformer_sw model feedBack splits with does not use it.
-pip install "diffq-fixed>=0.2" --no-deps --only-binary=:all: || true
+# --only-binary=:all: makes pip fail rather than fall back to the sdist, so this can
+# never start a compile.
+#
+# No `|| true` here on purpose: that would hide a network/index/permissions failure too,
+# and you would think diffq was installed when it isn't. Let it fail loudly, and skip it
+# ONLY if pip says "No matching distribution found" / "Could not find a version that
+# satisfies" — that means no wheel exists for your Python (macOS on 3.11+, Linux on 3.13),
+# which is safe: the bs_roformer_sw model feedBack splits with does not use diffq.
+pip install "diffq-fixed>=0.2" --no-deps --only-binary=:all:
 ```
 
 > ⚠️ **Why the separate install steps?**
