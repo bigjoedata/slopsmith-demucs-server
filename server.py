@@ -379,7 +379,11 @@ async def separate_upload(
     # Queue the job
     result = _enqueue_job(job_id, tmp.name, stem_list, use_model)
     if result.get("error"):
-        return JSONResponse(result, 503)
+        # 503 means "no capacity, back off and retry" — and clients (including feedBack's
+        # own splitter) treat it exactly that way. A stem-set CONFLICT is not a capacity
+        # problem, and returning one as 503 makes a client back off against a condition
+        # backing off cannot fix, with no way to tell the two apart. Let the decision choose.
+        return JSONResponse(result, result.pop("status_code", 503))
     return result
 
 
@@ -418,7 +422,11 @@ async def separate_url(
 
     result = _enqueue_job(job_id, tmp.name, stem_list, use_model)
     if result.get("error"):
-        return JSONResponse(result, 503)
+        # 503 means "no capacity, back off and retry" — and clients (including feedBack's
+        # own splitter) treat it exactly that way. A stem-set CONFLICT is not a capacity
+        # problem, and returning one as 503 makes a client back off against a condition
+        # backing off cannot fix, with no way to tell the two apart. Let the decision choose.
+        return JSONResponse(result, result.pop("status_code", 503))
     return result
 
 
@@ -1767,6 +1775,7 @@ def _enqueue_job(job_id, audio_path, stem_list, model):
                              "set is unknown (it was started by an earlier server version). "
                              "Retry once it finishes.",
                     "job_id": job_id,
+                    "status_code": 409,     # Conflict, NOT 503: capacity is fine.
                 }
             in_flight = {s.strip().lower() for s in in_flight_raw}
             if wanted <= in_flight:
@@ -1775,6 +1784,7 @@ def _enqueue_job(job_id, audio_path, stem_list, model):
                 "error": "A separation for this audio is already running with a smaller stem "
                          "set. Retry once it finishes and the extra stems will be computed.",
                 "job_id": job_id,
+                "status_code": 409,         # Conflict, NOT 503: capacity is fine.
             }
 
         # ── Nothing usable exists: take the job. ─────────────────────────────────────────

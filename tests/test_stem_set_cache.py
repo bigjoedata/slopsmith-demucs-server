@@ -314,5 +314,34 @@ def test_in_flight_legacy_job_with_no_stem_list_is_not_joined_blindly():
     assert not started
 
 
+# ── a conflict is not an outage ──────────────────────────────────────────────
+
+def test_conflicts_are_409_not_503():
+    """503 means "no capacity, back off and retry", and clients treat it that way —
+    feedBack's own splitter retries 503 with backoff. A stem-set conflict is not a capacity
+    problem: backing off cannot fix it, and a client that sees 503 has no way to tell the two
+    apart. Capacity exhaustion keeps 503; conflicts get 409."""
+    jobs = _in_flight(["drums", "bass", "vocals", "other"])
+    enqueue, _ = _load_enqueue_job(jobs)
+    result = enqueue(JOB_ID, "/tmp/a.ogg", SIX_NAMES, "bs_roformer_sw")
+    assert result["status_code"] == 409
+
+    jobs = collections.OrderedDict({JOB_ID: {
+        "job_id": JOB_ID, "status": "processing", "progress": 10, "stems": {},
+        "error": None, "model": "bs_roformer_sw", "created_at": time.time(),
+    }})   # legacy job: unknown stem set
+    enqueue, _ = _load_enqueue_job(jobs)
+    assert enqueue(JOB_ID, "/tmp/a.ogg", SIX_NAMES, "bs_roformer_sw")["status_code"] == 409
+
+
+def test_capacity_exhaustion_is_still_503():
+    """The one case 503 is actually for. It must NOT be reclassified — a client SHOULD back
+    off and retry here, which is exactly what 503 tells it to do."""
+    enqueue, _ = _load_enqueue_job(collections.OrderedDict(), max_concurrent=0)
+    result = enqueue(JOB_ID, "/tmp/a.ogg", SIX_NAMES, "bs_roformer_sw")
+    assert "error" in result
+    assert result.get("status_code") is None, "absent => the route's 503 default applies"
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
