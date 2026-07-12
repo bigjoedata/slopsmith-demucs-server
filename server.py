@@ -1687,13 +1687,47 @@ def _enqueue_job(job_id, audio_path, stem_list, model):
     """Create a job and start processing in background."""
     global active_count
 
+    wanted = {s.strip().lower() for s in stem_list}
+
     with jobs_lock:
-        # If job already exists and is processing/complete, return it
+        # If a job for this audio+model already exists, reuse it — but ONLY if it actually
+        # covers what this caller asked for.
+        #
+        # It used to return the existing job's stems regardless. Since job_id is
+        # (audio, model) and NOT the stem set, a 4-stem separation followed by a 6-stem
+        # request on the same audio silently returned the 4 — in 0 ms, looking like a fast
+        # success. The caller asked for guitar and piano and simply didn't get them, with no
+        # error and nothing to indicate the answer was stale rather than authoritative.
         existing = jobs.get(job_id)
         if existing and existing["status"] in ("processing", "complete"):
             if existing["status"] == "complete":
-                return {"job_id": job_id, "stems": existing["stems"], "cached": True}
-            return {"job_id": job_id, "status": "processing"}
+                have = {k.strip().lower()
+                        for k in (existing.get("stems_all") or existing.get("stems") or {})}
+                if wanted <= have:
+                    all_urls = existing.get("stems_all") or existing.get("stems") or {}
+                    return {
+                        "job_id": job_id,
+                        "stems": {s: all_urls[s.strip().lower()]
+                                  for s in stem_list if s.strip().lower() in all_urls},
+                        "cached": True,
+                    }
+                # Not covered: the previous run produced a smaller set (an older, narrower
+                # request, or a job from before this fix). Fall through and re-separate, so
+                # the caller gets what it actually asked for.
+            else:
+                # In flight. If its stem set covers ours we can ride along; if not, the
+                # result would be short, so don't attach to it — but we also can't run two
+                # jobs under one id, so tell the caller plainly instead of handing back a
+                # job that will complete without their stems.
+                in_flight = {s.strip().lower() for s in (existing.get("stem_list") or [])}
+                if not in_flight or wanted <= in_flight:
+                    return {"job_id": job_id, "status": "processing"}
+                return {
+                    "error": "A separation for this audio is already running with a smaller "
+                             "stem set. Retry once it finishes and the extra stems will be "
+                             "computed.",
+                    "job_id": job_id,
+                }
 
     with active_lock:
         if active_count >= MAX_CONCURRENT:
@@ -1704,6 +1738,12 @@ def _enqueue_job(job_id, audio_path, stem_list, model):
         "status": "processing",
         "progress": 0,
         "stems": {},
+        # What THIS run was asked for, and (once complete) everything the model actually
+        # produced. job_id is (audio, model) and does not include the stem set, so a later
+        # request for a different set has to be able to tell whether this job covers it.
+        "stem_list": list(stem_list),
+        "stems_all": {},
+        "missing": [],
         "error": None,
         "model": model,
         "created_at": time.time(),
@@ -1785,19 +1825,25 @@ def _run_demucs(job_id, audio_path, stem_list, model):
         cache_path = _cache_entry_path(job_id)
         cache_path.mkdir(parents=True, exist_ok=True)
 
-        stems_result = {}
-        for stem_name in stem_list:
-            src = out_track_dir / f"{stem_name}.wav"
-            if not src.exists():
-                continue
-
-            wav_dest = cache_path / f"{stem_name}.wav"
+        # Cache EVERY stem the model produced, not just this caller's subset — see the note
+        # in _run_roformer. demucs writes its full stem set to out_track_dir whether we take
+        # them or not; dropping the extras means the next request for a superset re-runs a
+        # separation we already did.
+        stems_all = {}
+        for src in sorted(out_track_dir.glob("*.wav")):
+            label = src.stem.strip().lower()
+            wav_dest = cache_path / f"{label}.wav"
             shutil.copy2(src, wav_dest)
-            stems_result[stem_name] = f"/download/{job_id}/{stem_name}.wav"
+            stems_all[label] = f"/download/{job_id}/{label}.wav"
 
-        if stems_result:
+        stems_result = {s: stems_all[s.strip().lower()]
+                        for s in stem_list if s.strip().lower() in stems_all}
+
+        if stems_all:
             _remember_cache_entry(job_id)
-        _update_job(job_id, status="complete", progress=100, stems=stems_result)
+        missing = [s for s in stem_list if s.strip().lower() not in stems_all]
+        _update_job(job_id, status="complete", progress=100, stems=stems_result,
+                    stems_all=stems_all, missing=missing)
 
     except subprocess.TimeoutExpired:
         proc.kill()
@@ -1882,18 +1928,32 @@ def _run_roformer(job_id, audio_path, stem_list, model):
         cache_path = _cache_entry_path(job_id)
         cache_path.mkdir(parents=True, exist_ok=True)
 
-        stems_result = {}
-        for stem_name in stem_list:
-            src = produced.get(stem_name.strip().lower())
-            if not src or not src.exists():
+        # Cache EVERY stem the model produced, not just the ones this caller asked for.
+        #
+        # The separation computes them all regardless — bs_roformer_sw always emits six —
+        # so discarding the unrequested ones means the next request for a larger stem set
+        # pays the full inference again (~2 min on a GPU) for stems we had already made and
+        # deleted. Caching all of them turns that into a cache hit, and it is what lets the
+        # cache honour a request for a SUPERSET of what was originally asked for.
+        stems_all = {}
+        for label, src in produced.items():
+            if not src.exists():
                 continue
-            dest = cache_path / f"{stem_name}.flac"
+            dest = cache_path / f"{label}.flac"
             shutil.copy2(src, dest)
-            stems_result[stem_name] = f"/download/{job_id}/{stem_name}.flac"
+            stems_all[label] = f"/download/{job_id}/{label}.flac"
 
-        if stems_result:
+        # ...but return only what this caller asked for.
+        stems_result = {s: stems_all[s.strip().lower()]
+                        for s in stem_list if s.strip().lower() in stems_all}
+
+        if stems_all:
             _remember_cache_entry(job_id)
-        _update_job(job_id, status="complete", progress=100, stems=stems_result)
+        # `missing` is explicit: a caller that asked for `guitar` from a 4-stem model should
+        # be told it isn't coming, not silently handed a short dict and left to wonder.
+        missing = [s for s in stem_list if s.strip().lower() not in stems_all]
+        _update_job(job_id, status="complete", progress=100, stems=stems_result,
+                    stems_all=stems_all, missing=missing)
 
     except subprocess.TimeoutExpired:
         if proc:
