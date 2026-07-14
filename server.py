@@ -932,9 +932,12 @@ async def align_lyrics(
             # Use the already-normalised value (strip+lower) when the
             # caller supplied a language hint, so detected_lang is always
             # clean before passing to _get_whisperx_aligner().
+            # Branch on the NORMALIZED value, not the raw one. `language=" "` is truthy, so the
+            # raw check took the "caller supplied a hint" path and set detected_lang to "" —
+            # which then asks _get_whisperx_aligner() for a model in the language named "".
+            # Whitespace means no hint; fall through to detection.
             detected_lang = (
-                normalized_lang if language
-                else (transcribed.get("language") or "en").lower()
+                normalized_lang or (transcribed.get("language") or "en").lower()
             )
             raw_speech_segments = transcribed.get("segments", []) or []
 
@@ -1312,14 +1315,22 @@ async def transcribe_audio(
     # far. A client that disconnects mid-upload, or a full disk, raises HERE, and the handler
     # exits leaving the file behind. One orphan is nothing; one per failed upload, on a server
     # that runs for months, is a disk slowly filling with nothing.
+    import asyncio
     try:
-        # Stream it. `await file.read()` pulls the entire stem into RAM before a byte reaches
-        # disk — a 4-minute lossless vocals stem is ~40 MB, MAX_CONCURRENT of them at once is
-        # ~80 MB of pure waste, and nothing stops a caller uploading a 2 GB file to find out
-        # what happens. Chunks cost nothing and cap the exposure.
+        # Stream it, and write OFF the event loop.
+        #
+        # `await file.read()` pulls the whole stem into RAM before a byte reaches disk — a
+        # 4-minute lossless vocals stem is ~40 MB, and nothing stops a caller uploading 2 GB to
+        # see what happens. Chunks cap that.
+        #
+        # But `tmp.write()` is blocking disk I/O, and this handler runs ON the loop: a slow disk
+        # (a NAS, a spinning volume, an overloaded container) would stall every other request in
+        # the process while one upload dribbles in — including /health, which is what tells a
+        # client the server is alive. The heavy transcription is already offloaded; the write
+        # has to be too, or the careful part is undone by the careless one.
         while chunk := await file.read(1024 * 1024):
-            tmp.write(chunk)
-        tmp.close()
+            await asyncio.to_thread(tmp.write, chunk)
+        await asyncio.to_thread(tmp.close)
     except Exception:
         tmp.close()
         try:
@@ -1386,7 +1397,6 @@ async def transcribe_audio(
             except OSError:
                 pass
 
-    import asyncio
     loop = asyncio.get_running_loop()
     result = await loop.run_in_executor(None, _do_transcribe)
 

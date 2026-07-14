@@ -135,6 +135,43 @@ try:
 except ValueError:
     pass
 
+# 2d. A blank hint must also fall through to DETECTION, not pin the language to "".
+#     /align branched on the raw `language` (truthy for " ") while normalizing to "" — so a
+#     whitespace hint set detected_lang="" and then asked for an aligner in the language named
+#     "". Both endpoints now branch on the normalized value.
+_captured_lang = {}
+_whisperx.align = lambda segments, model, meta, audio, device, return_char_alignments=False: {
+    "segments": [{"start": 1.0, "end": 2.0, "text": "hola",
+                  "words": [{"word": "hola", "start": 1.0, "end": 2.0, "score": 0.9}]}]
+}
+_install([{"start": 0.0, "end": 1.5, "text": "hola"}], language="pt")   # what Whisper detects
+# AFTER _install, which installs its own aligner stub — this one records what it was asked for.
+def _capture_aligner(lang):
+    _captured_lang["lang"] = lang
+    return (MagicMock(), MagicMock())
+server._get_whisperx_aligner = _capture_aligner
+
+r = client.post("/transcribe", files=AUDIO, data={"language": "  "})
+if r.status_code != 200:
+    fail("a whitespace hint must not be an error, got %s" % r.status_code)
+if _captured_lang.get("lang") != "pt":
+    fail("a blank hint must fall through to DETECTION, aligner asked for %r"
+         % (_captured_lang.get("lang"),))
+if r.json().get("language") != "pt":
+    fail("the detected language must be reported, got %r" % r.json().get("language"))
+
+# 2e. The SAME branch in /align — which is where this bug actually lived. It keyed off the raw
+#     `language` (truthy for " ") while normalizing to "", so a whitespace hint asked
+#     _get_whisperx_aligner() for a model in the language named "". A test that only drives
+#     /transcribe cannot see that; this one drives /align.
+_captured_lang.clear()
+r = client.post("/align", files=AUDIO, data={"text": "hola mundo", "language": "  "})
+if r.status_code != 200:
+    fail("/align with a whitespace hint should still work, got %s: %s" % (r.status_code, r.text[:200]))
+if _captured_lang.get("lang") != "pt":
+    fail("/align: a blank hint must fall through to DETECTION, aligner asked for %r"
+         % (_captured_lang.get("lang"),))
+
 # 3. An instrumental is an ANSWER, not an error: no vocals -> no words, 200.
 _install([])
 r = client.post("/transcribe", files=AUDIO)
