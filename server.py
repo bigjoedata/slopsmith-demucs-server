@@ -85,11 +85,18 @@ CACHE_DIR = Path(os.environ.get(
 ))
 MAX_CONCURRENT = 2
 
-# Whisper segments shorter than this are dropped before wav2vec2 alignment: the aligner tends to
-# return empty alignments for sub-frame windows, so passing them in degrades the output instead
-# of adding to it. Whisper emits them on breaths, noise and stem bleed. Shared by /align and
+# A Whisper segment must be LONGER than this to be aligned — the comparison is a strict `>`, so
+# a segment of exactly this duration is dropped too. wav2vec2 tends to return empty alignments
+# for sub-frame windows, so passing them in degrades the output instead of adding to it, and
+# Whisper emits them constantly on breaths, noise and stem bleed. Shared by /align and
 # /transcribe — the two used to carry the same 0.2 independently, which is how they drift.
 _MIN_SEGMENT_SECONDS = 0.2
+
+
+# Any absolute path: POSIX (/app/cache/...) or Windows (C:\Users\...). The lookbehind keeps
+# URLs intact — the "//" in "https://host/x" is not a filesystem path, and mangling it would
+# destroy an error that is mostly about which host we failed to reach.
+_ABS_PATH_RE = re.compile(r"(?<![\w:/\\])(?:[A-Za-z]:[\\/]|/)[\w.\-/\\]{2,}")
 
 
 def _client_safe_error(e: Exception, where: str) -> str:
@@ -109,12 +116,15 @@ def _client_safe_error(e: Exception, where: str) -> str:
     """
     traceback.print_exc()
     msg = str(e)
+    # Named roots first, so the common cases read as themselves rather than as <path>.
     for secret, placeholder in (
         (str(CACHE_DIR), "<cache>"),
         (str(Path.home()), "<home>"),
     ):
         if secret and secret not in ("/", "\\"):
             msg = msg.replace(secret, placeholder)
+    # Then anything else that looks like an absolute path.
+    msg = _ABS_PATH_RE.sub("<path>", msg)
     msg = msg.strip() or e.__class__.__name__
     if len(msg) > 500:
         msg = msg[:500] + "…"
@@ -1285,8 +1295,12 @@ async def transcribe_audio(
     # exits leaving the file behind. One orphan is nothing; one per failed upload, on a server
     # that runs for months, is a disk slowly filling with nothing.
     try:
-        content = await file.read()
-        tmp.write(content)
+        # Stream it. `await file.read()` pulls the entire stem into RAM before a byte reaches
+        # disk — a 4-minute lossless vocals stem is ~40 MB, MAX_CONCURRENT of them at once is
+        # ~80 MB of pure waste, and nothing stops a caller uploading a 2 GB file to find out
+        # what happens. Chunks cost nothing and cap the exposure.
+        while chunk := await file.read(1024 * 1024):
+            tmp.write(chunk)
         tmp.close()
     except Exception:
         tmp.close()

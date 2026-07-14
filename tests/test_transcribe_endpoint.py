@@ -169,6 +169,16 @@ if str(server.CACHE_DIR) in err:
 if "CUDA OOM" not in err or "RuntimeError" not in err:
     fail("the diagnosis must survive scrubbing (type + message), got %r" % err)
 
+# 3d. The scrubber must scrub PATHS, not everything path-shaped. A URL is not a filesystem path,
+#     and mangling one destroys an error that is mostly about which host we could not reach.
+_probe = server._ABS_PATH_RE
+if _probe.sub("<path>", "Connection refused: https://huggingface.co/api/models/x") !=         "Connection refused: https://huggingface.co/api/models/x":
+    fail("the path scrubber ate a URL - that IS the diagnosis for a network failure")
+if "<path>" not in _probe.sub("<path>", "PermissionError: /var/lib/secret/thing.bin"):
+    fail("an absolute path outside CACHE_DIR/home must still be scrubbed")
+if _probe.sub("<path>", "failed at 3/4 steps") != "failed at 3/4 steps":
+    fail("the scrubber mangled ordinary text")
+
 # 4. /align still REQUIRES text — that difference is the whole reason /transcribe exists, and
 #    if /align ever stopped 422ing here, the original bug would have become invisible instead
 #    of fixed.
