@@ -276,3 +276,59 @@ class TestFirstSweepImmediate:
             f"time.sleep should be the LAST statement in the while loop, "
             f"but last statement is: {last_stmt_text[:100]}"
         )
+
+# ── the sweeper must not eat model weights ──────────────────────────────────
+
+class TestSweeperOnlyDeletesStemCaches:
+    """The 24h TTL sweeper deleted the 700 MB BS-Roformer-SW checkpoint every day.
+
+    Model weights live under CACHE_DIR alongside the stem caches, and the sweeper protected
+    them with a BLACKLIST (`torch`, `huggingface`, `locale`). It forgot `_roformer-models`.
+    So every 24 hours the checkpoint was deleted, the next start re-downloaded 700 MB, and
+    nothing anywhere said why. Seen in the wild.
+
+    A blacklist is the wrong shape here: it must enumerate everything that has to survive, so
+    whatever it forgets gets destroyed — including any model dir a future version adds. The
+    sweeper now deletes only names that LOOK like stem-cache entries.
+    """
+
+    SERVER_SRC = SERVER_PY.read_text(encoding="utf-8")
+
+    def _entry_re(self):
+        ns = {"re": re}
+        for line in self.SERVER_SRC.splitlines():
+            if line.startswith("_CACHE_ENTRY_RE"):
+                exec(line, ns)
+                return ns["_CACHE_ENTRY_RE"]
+        raise AssertionError("_CACHE_ENTRY_RE not found in server.py")
+
+    def test_a_real_stem_cache_entry_is_deletable(self):
+        # _job_id_for() -> f"{sha256[:16]}-{model-slug}"
+        assert self._entry_re().fullmatch("7a819518228bca22-bs-roformer-sw")
+        assert self._entry_re().fullmatch("deadbeefdeadbeef-htdemucs-ft")
+
+    def test_the_roformer_model_dir_is_NOT_deletable(self):
+        """The actual bug. This directory holds a 700 MB checkpoint."""
+        assert not self._entry_re().fullmatch("_roformer-models")
+
+    def test_the_other_model_dirs_are_not_deletable(self):
+        for name in ("torch", "huggingface", "locale"):
+            assert not self._entry_re().fullmatch(name)
+
+    def test_an_unknown_future_model_dir_is_not_deletable(self):
+        """The point of a whitelist: a model dir nobody has added yet must survive too. Under
+        the old blacklist it would have been silently deleted after 24h."""
+        for name in ("_mdx-models", "whisper-models", "some-new-cache", "openvino"):
+            assert not self._entry_re().fullmatch(name), name
+
+    def test_roformer_dir_is_also_on_the_preserve_list(self):
+        # Belt as well as braces: even if the pattern check were bypassed, the name is listed.
+        assert '"_roformer-models"' in self.SERVER_SRC
+
+    def test_the_sweeper_actually_consults_the_pattern(self):
+        # A constant nobody calls fixes nothing.
+        src = self.SERVER_SRC
+        start = src.index("def _cache_cleanup_loop")
+        body = src[start:start + 2000]
+        assert "_CACHE_ENTRY_RE" in body, "the cleanup loop must check the pattern"
+
