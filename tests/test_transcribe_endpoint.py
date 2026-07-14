@@ -69,6 +69,11 @@ def _install(segments, language="en"):
     server._get_whisperx_aligner = lambda lang: (MagicMock(), MagicMock())
     server._whisperx_device = lambda: "cpu"
 
+# TestClient fires FastAPI's startup event, which spawns the warmup thread — i.e. model loads
+# and, on a cold cache, multi-GB downloads. In a test whose whole premise is "no heavy ML", that
+# would be the one thing still reaching for the network.
+server.app.state.skip_warmup = True
+
 client = TestClient(server.app)
 AUDIO = {"file": ("vocals.ogg", io.BytesIO(b"not really ogg"), "audio/ogg")}
 
@@ -144,6 +149,25 @@ _install([{"start": 0.0, "end": 0.1, "text": "hm"}])   # nothing BUT sub-frame n
 r = client.post("/transcribe", files=AUDIO)
 if r.status_code != 200 or r.json().get("segments") != []:
     fail("a stem of only sub-frame noise is an instrumental, got %s %s" % (r.status_code, r.text[:200]))
+
+# 3c. An unexpected failure must not hand the caller the host's filesystem layout. This server
+#     gets exposed on a LAN; the cache path is nobody's business. But the DIAGNOSIS is the
+#     caller's business — losing it is how the bug this endpoint fixes stayed hidden — so the
+#     exception type and message survive, minus the paths.
+class _Boom:
+    def transcribe(self, audio, **kw):
+        raise RuntimeError("CUDA OOM while loading %s/models--x/snapshots/abc/model.bin"
+                           % server.CACHE_DIR)
+
+server._get_whisperx_model = lambda: _Boom()
+r = client.post("/transcribe", files=AUDIO)
+if r.status_code != 500:
+    fail("an unexpected failure should be a 500, got %s" % r.status_code)
+err = r.json().get("error", "")
+if str(server.CACHE_DIR) in err:
+    fail("the error leaked the host cache path to the caller: %r" % err)
+if "CUDA OOM" not in err or "RuntimeError" not in err:
+    fail("the diagnosis must survive scrubbing (type + message), got %r" % err)
 
 # 4. /align still REQUIRES text — that difference is the whole reason /transcribe exists, and
 #    if /align ever stopped 422ing here, the original bug would have become invisible instead

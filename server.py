@@ -26,6 +26,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import traceback
 import threading
 import time
 import uuid
@@ -89,6 +90,36 @@ MAX_CONCURRENT = 2
 # of adding to it. Whisper emits them on breaths, noise and stem bleed. Shared by /align and
 # /transcribe — the two used to carry the same 0.2 independently, which is how they drift.
 _MIN_SEGMENT_SECONDS = 0.2
+
+
+def _client_safe_error(e: Exception, where: str) -> str:
+    """Log an unexpected exception in full, and return a version fit to hand a caller.
+
+    The tension is real and worth being explicit about. Returning bare ``str(e)`` leaks host
+    filesystem layout — cache paths, home directory, container internals — to whoever can reach
+    the endpoint, and this server is routinely exposed on a LAN. But returning a flat "internal
+    error" throws away the diagnosis, and the caller has no access to these logs: the whole
+    reason the client bug that necessitated /transcribe stayed hidden for so long is that the
+    message explaining it never reached anybody who could act on it.
+
+    So: the full traceback goes to the server's stdout, where the operator can see it, and the
+    caller gets the exception type and message with absolute paths scrubbed. "CUDA out of memory"
+    survives — it's the answer, and it isn't a secret. "/app/cache/models--foo/snapshots/…" does
+    not.
+    """
+    traceback.print_exc()
+    msg = str(e)
+    for secret, placeholder in (
+        (str(CACHE_DIR), "<cache>"),
+        (str(Path.home()), "<home>"),
+    ):
+        if secret and secret not in ("/", "\\"):
+            msg = msg.replace(secret, placeholder)
+    msg = msg.strip() or e.__class__.__name__
+    if len(msg) > 500:
+        msg = msg[:500] + "…"
+    print(f"[{where}] ERROR: {e.__class__.__name__}: {e}")
+    return f"{e.__class__.__name__}: {msg}"
 CACHE_TTL = os.environ.get("CACHE_TTL", "24h")
 # Directories under CACHE_DIR that hold model weights (never auto-deleted).
 #
@@ -1319,7 +1350,7 @@ async def transcribe_audio(
             # mistake from a server fault.
             return {"error": str(e), "_http_status": 400}
         except Exception as e:
-            return {"error": str(e)}
+            return {"error": _client_safe_error(e, "transcribe")}
         finally:
             try:
                 os.unlink(tmp.name)
