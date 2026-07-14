@@ -84,8 +84,30 @@ CACHE_DIR = Path(os.environ.get(
 ))
 MAX_CONCURRENT = 2
 CACHE_TTL = os.environ.get("CACHE_TTL", "24h")
-# Directories under CACHE_DIR that hold model weights (never auto-deleted)
-_PRESERVED_CACHE_DIRS = frozenset({"torch", "huggingface", "locale"})
+# Directories under CACHE_DIR that hold model weights (never auto-deleted).
+#
+# This list was a BLACKLIST, and a blacklist is the wrong shape for this job: it has to
+# enumerate everything that must survive, so anything it forgets gets deleted. It forgot
+# `_roformer-models`, and the 24h sweeper duly deleted the 700 MB BS-Roformer-SW checkpoint
+# every single day — users re-downloaded it on the next start, forever, with no error and no
+# clue why. (Reported at got-feedBack/feedBack-plugin-stem-splitter, seen in the wild.)
+#
+# The real fix is _CACHE_ENTRY_RE below: only delete directories that LOOK like stem-cache
+# entries. The list stays as a second line of defence.
+_PRESERVED_CACHE_DIRS = frozenset({"torch", "huggingface", "locale", "_roformer-models"})
+
+# What a stem-cache directory is named: _job_id_for() -> f"{audio_hash}-{slug}", where the
+# hash is sha256[:16] (hex) and the slug is a sanitized model name.
+#
+# The sweeper only deletes things matching THIS. Anything else under CACHE_DIR — a model dir
+# we added, a model dir some future version adds, a stray file a user dropped in — is left
+# alone. Deleting only what we recognize is the only version of this that stays correct as
+# the cache dir grows new neighbours.
+# Exactly what _job_id_for() emits: sha256[:16] (lowercase hex) + "-" + a slug that is
+# re.sub(r"[^A-Za-z0-9]+", "-", model).strip("-").lower() — so lowercase, digits and
+# hyphens, nothing else. Matching more loosely than we emit only widens the set of
+# directories we are willing to delete, which is the opposite of the point.
+_CACHE_ENTRY_RE = re.compile(r"^[0-9a-f]{16}-[a-z0-9-]+$")
 
 
 def _parse_ttl(ttl_str: str) -> int | None:
@@ -2193,9 +2215,19 @@ def _run_warmup() -> None:
 
 def _cache_cleanup_loop() -> None:
     """Background daemon thread: periodically delete expired stem cache dirs.
-    
-    Walks CACHE_DIR, skips preserved directories (torch, huggingface, locale),
-    and deletes any stem cache directory whose mtime exceeds CACHE_TTL.
+
+    Walks CACHE_DIR and deletes a directory only if it BOTH:
+
+      * is not in _PRESERVED_CACHE_DIRS (torch, huggingface, locale, _roformer-models), and
+      * matches _CACHE_ENTRY_RE — i.e. it looks like something _job_id_for() produced.
+
+    The second condition is the load-bearing one. This used to be a preserve-list alone, which
+    is a blacklist: it has to enumerate everything that must survive, so whatever it forgets
+    gets destroyed. It forgot `_roformer-models`, and duly deleted the 700 MB BS-Roformer-SW
+    checkpoint every 24 hours — users re-downloaded it on the next start, forever, with no
+    error and no clue why. Deleting only what we RECOGNIZE is the only version of this that
+    stays correct as the cache dir gains new neighbours.
+
     Runs every 10 minutes.
     """
     if CACHE_TTL_SECONDS is None:
@@ -2211,6 +2243,10 @@ def _cache_cleanup_loop() -> None:
                 if not entry.is_dir():
                     continue
                 if entry.name in _PRESERVED_CACHE_DIRS:
+                    continue
+                if not _CACHE_ENTRY_RE.fullmatch(entry.name):
+                    # Not a stem-cache entry -> not ours to delete. Model weights, and
+                    # anything else that comes to live under CACHE_DIR, land here.
                     continue
                 try:
                     mtime = entry.stat().st_mtime
