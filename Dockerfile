@@ -40,7 +40,9 @@ WORKDIR /app
 COPY requirements.txt .
 
 # ---- Install main Python dependencies ----
-# whisperx pins torch~=2.8.0 + torchaudio~=2.8.0 — this satisfies torchcrepe too.
+# Install PyTorch & torchaudio with CUDA 12.1 support from pytorch.org to ensure sm_61 compatibility
+RUN pip install --no-cache-dir torch==2.3.0 torchaudio==2.3.0 --index-url https://download.pytorch.org/whl/cu121
+
 # requirements.txt deliberately does NOT list audio-separator or demucs; both are
 # installed --no-deps below. See the ⚠️ note at the top of that file.
 RUN pip install --no-cache-dir -r requirements.txt

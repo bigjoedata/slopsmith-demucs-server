@@ -84,6 +84,7 @@ CACHE_DIR = Path(os.environ.get(
     Path.home() / ".cache" / "slopsmith-demucs",
 ))
 MAX_CONCURRENT = 2
+WHISPERX_COMPUTE_TYPE = os.environ.get("WHISPERX_COMPUTE_TYPE", "")
 
 # A Whisper segment must be LONGER than this to be aligned — the comparison is a strict `>`, so
 # a segment of exactly this duration is dropped too. wav2vec2 tends to return empty alignments
@@ -579,13 +580,28 @@ def _whisperx_device() -> str:
 
 
 def _whisperx_compute_type() -> str:
+    # If the user explicitly configured a compute type via env or CLI, use it
+    if WHISPERX_COMPUTE_TYPE:
+        return WHISPERX_COMPUTE_TYPE
+
     # faster-whisper / CTranslate2 picks compute_type per-device. CUDA
     # benefits from float16; CPU only supports int8/float32 reliably.
-    # Key off the effective runtime device (which may be forced to "cpu"
-    # via --device on a CUDA-capable host) — keying off _gpu_available
-    # would pick float16 on CPU and crash faster-whisper at load time.
-    # Use startswith("cuda") to handle device strings like "cuda:0".
-    return "float16" if _whisperx_device().startswith("cuda") else "int8"
+    device = _whisperx_device()
+    if device.startswith("cuda"):
+        try:
+            import torch
+            if torch.cuda.is_available():
+                cap = torch.cuda.get_device_capability()
+                # Pascal (6.x) and older GPUs do not support efficient float16 in ctranslate2.
+                # Explicitly fallback to int8 for these legacy devices to prevent crashes.
+                if cap[0] < 7:
+                    print(f"[server] CUDA capability {cap[0]}.{cap[1]} < 7.0 detected (Pascal/legacy GPU). "
+                          "Defaulting WhisperX compute type to 'int8' for compatibility.", flush=True)
+                    return "int8"
+        except Exception as e:
+            print(f"[server] Failed to auto-detect CUDA capability: {e}. Defaulting to float16.", flush=True)
+        return "float16"
+    return "int8"
 
 
 def _mark_lazy_loaded(name: str) -> None:
@@ -2506,7 +2522,7 @@ def _model_idle_loop() -> None:
 # ── CLI entry point ─────────────────────────────────────────────────────
 
 def main():
-    global _model, _device, _gpu_available, API_KEY
+    global _model, _device, _gpu_available, API_KEY, WHISPERX_COMPUTE_TYPE
 
     parser = argparse.ArgumentParser(description="Slopsmith Demucs Separation Service")
     parser.add_argument("--port", type=int, default=7865, help="Port to listen on")
@@ -2520,6 +2536,11 @@ def main():
         help="Skip the startup model-weight prefetch. Per-endpoint calls "
         "will lazy-download instead. Useful for restricted CI environments.",
     )
+    parser.add_argument(
+        "--whisperx-compute-type",
+        default="",
+        help="WhisperX compute type (float16, float32, int8, int8_float16)",
+    )
     args = parser.parse_args()
 
     if args.model:
@@ -2528,10 +2549,12 @@ def main():
         _device = args.device
     if args.api_key:
         API_KEY = args.api_key
+    if args.whisperx_compute_type:
+        WHISPERX_COMPUTE_TYPE = args.whisperx_compute_type
 
     _gpu_available = _detect_gpu()
     if not _device:
-        _device = "cuda" if _gpu_available else "cpu"
+        _device = DEMUCS_DEVICE or ("cuda" if _gpu_available else "cpu")
 
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     ROFORMER_MODEL_DIR.mkdir(parents=True, exist_ok=True)
